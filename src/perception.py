@@ -69,6 +69,7 @@ class Message:
     x: float = 0.0
     w: float = 0.0
     last_y: float = 0.0     # top of the most recent folded line; fold bookkeeping only
+    ts: int = 0             # epoch seconds when the source knows it（数据库直读）；OCR 为 0
 
 
 @dataclass

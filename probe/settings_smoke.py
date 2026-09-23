@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / 'src'))
 sys.path.insert(0, str(ROOT / 'tests'))
 from test_settings import Server, SettingsNetwork
 import userconfig
+import settings_config as config
 from settings import SettingsController
 
 
@@ -91,6 +92,27 @@ try:
         c.window.close()
         reopened = SettingsController.alloc().init().build()
         assert reopened.fields['OPENAI']['MODEL'].stringValue() == 'typed-model'
+        # 数据源标签页：默认 db；切到 OCR 保存后写进配置，且不破坏其他行。
+        assert next(i for i in reopened.tabs.tabViewItems()
+                    if i.identifier() == 'SOURCE').label() == '感知 · 数据源'
+        assert reopened.source_seg.selectedSegment() == 1, '默认数据源必须是 db（数据库直读）'
+        reopened.source_seg.setSelectedSegment_(0)
+        reopened.save_button.performClick_(None)
+        assert '已保存' in reopened.status.stringValue(), reopened.status.stringValue()
+        assert userconfig.parse_env_file(path)['JEV_SOURCE'] == 'ocr'
+        assert '# keep\nJEV_TONES="名字=说明"\n' in path.read_text()
+        assert not reopened.changed()
+        again = SettingsController.alloc().init().build()
+        assert again.source_seg.selectedSegment() == 0, '选中态应来自配置'
+        source_view = next(i for i in again.tabs.tabViewItems()
+                           if i.identifier() == 'SOURCE').view()
+        assert any(isinstance(v, A.NSButton) and v.title() == '在终端里提取密钥…'
+                   for v in source_view.subviews()), '缺少提取密钥入口'
+        try:      # 非法数据源必须被写回逻辑挡下，否则启动时会静默回退
+            config.write_settings(path, path.read_text(), {'JEV_SOURCE': 'screen'})
+            raise AssertionError('非法数据源应被拒绝')
+        except ValueError:
+            pass
         # Existing keychain expression remains byte-for-byte when editing only the model.
         path.write_text('export OPENAI_API_KEY="$(security find-generic-password -w)" # keep expression\nOPENAI_MODEL=old\n')
         shell = SettingsController.alloc().init().build()
@@ -98,6 +120,6 @@ try:
         shell.save_button.performClick_(None)
         assert 'export OPENAI_API_KEY="$(security find-generic-password -w)" # keep expression\n' in path.read_text()
         assert shell.fields['OPENAI']['API_KEY'].stringValue() == ''
-        print('PASS: native buttons, async completion, models/manual entry, HTTP failure, secure save, restart isolation, reopen, shell-expression preservation')
+        print('PASS: native buttons, async completion, models/manual entry, HTTP failure, secure save, restart isolation, reopen, shell-expression preservation, data-source tab')
 finally:
     SettingsNetwork.tearDownClass()

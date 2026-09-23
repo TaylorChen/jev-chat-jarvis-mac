@@ -16,6 +16,10 @@ from generate import _endpoint, http_post_json, Generator, ThinkingOnlyError
 
 PREFIXES = ("TYPESAFE", "OPENAI", "ANTHROPIC")
 FIELDS = ("API_KEY", "BASE_URL", "MODEL")
+# 非模型设置：感知数据源与密钥文件位置。它们和数据源标签页一起保存，走同一套
+# 「只改被编辑的行、其余原样保留」的写回逻辑。
+EXTRA_KEYS = ("JEV_SOURCE", "JEV_KEYS_FILE")
+SOURCES = ("ocr", "db")
 DEFAULTS = {
     "TYPESAFE": ("https://api.typesafe.ai", "jev-latest"),
     "OPENAI": ("https://api.openai.com/v1", ""),
@@ -31,16 +35,26 @@ def read_document(path: Path) -> str:
         return ""
 
 
+def validate_source(value: str) -> str:
+    """数据源只能是 ocr / db；写进配置前先挡下来，免得启动时静默回退。"""
+    value = (value or "").strip().lower()
+    if value not in SOURCES:
+        raise ValueError("数据源只能填 ocr 或 db。")
+    return value
+
+
 def write_settings(path: Path, original: str, changes: dict[str, str]) -> str:
     """Change only edited assignments, preserve other lines, replace atomically at 0600."""
     if read_document(path) != original:
         raise ValueError("配置文件已被其他程序修改，请关闭设置窗口后重新打开。")
-    allowed = {f"{p}_{f}" for p in PREFIXES for f in FIELDS}
+    allowed = {f"{p}_{f}" for p in PREFIXES for f in FIELDS} | set(EXTRA_KEYS)
     if not changes.keys() <= allowed:
         raise ValueError("不支持的配置项。")
     for value in changes.values():
         if any(c in value for c in "\r\n\0"):
             raise ValueError("配置值不能含换行或空字符。")
+    if "JEV_SOURCE" in changes:
+        changes = dict(changes, JEV_SOURCE=validate_source(changes["JEV_SOURCE"]))
     remaining = dict(changes)
     lines = []
     for line in original.splitlines(keepends=True):

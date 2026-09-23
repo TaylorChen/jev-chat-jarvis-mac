@@ -39,6 +39,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/app"
 echo "==> 拷贝 Python 源码（版本 $VERSION / Python $PY_PIN）"
 cd "$ROOT"
 cp -R src "$APP/Contents/Resources/app/src"
+# 数据源 db 的密钥提取工具（原样引入的第三方代码）必须随包走：否则 .app 里
+# 「提取密钥」按钮指向不存在的文件；MIT 也要求版权声明随分发副本同行。
+cp -R tools "$APP/Contents/Resources/app/tools"
 cp pyproject.toml uv.lock README.md .python-version "$APP/Contents/Resources/app/"
 mkdir -p "$APP/Contents/Resources/app/packaging"
 cp packaging/bootstrap_uv.sh "$APP/Contents/Resources/app/packaging/"
@@ -47,6 +50,7 @@ if [ -f LICENSE ]; then cp LICENSE "$APP/Contents/Resources/app/"; fi
 if [ -f .env.example ]; then cp .env.example "$APP/Contents/Resources/app/"; fi
 # never ship local secrets or caches
 rm -rf "$APP/Contents/Resources/app/src/__pycache__"
+rm -rf "$APP/Contents/Resources/app/tools/wcdb_key_tool/__pycache__"
 find "$APP/Contents/Resources/app" -name '.DS_Store' -delete
 
 echo "==> 写 Info.plist"
@@ -84,8 +88,11 @@ set -u
 
 RES="$(cd "$(dirname "$0")" && pwd)"
 SUPPORT="$HOME/Library/Application Support/jev-jarvis"
-CONFIG="$HOME/.config/jev-jarvis"
+# 与 Python 侧 userconfig.config_dirs() 的顺序保持一致：XDG 优先，其次 ~/.config。
+# （Application Support 下的 env 由 Python 自己再读一遍，这里只负责导出给子进程。）
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/jev-jarvis"
 VENV="$SUPPORT/venv"
+LOCK_STAMP="$SUPPORT/uv.lock.sha256"
 LOG="$HOME/Library/Logs/jev-jarvis.log"
 mkdir -p "$SUPPORT" "$(dirname "$LOG")"
 
@@ -123,24 +130,40 @@ export HF_HUB_DISABLE_TELEMETRY=1
 # build_app.sh). uv keeps an existing environment as-is, so a venv built by a different
 # python would silently survive a rebuild — treat a mismatch like a missing venv.
 ready=0
+rebuild=1                                  # 缺 venv 或解释器不对：整个重建
 if [ -x "$VENV/bin/python" ]; then
     found="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo '?')"
     if [ "$found" = "@PYTHON_PIN@" ]; then
         ready=1
+        rebuild=0
     else
         log "虚拟环境是 Python $found，本包需要 @PYTHON_PIN@ —— 重建"
     fi
 fi
 
+# 解释器对得上、依赖也可能已经过时：随包 uv.lock 变了，uv 不会自动补上新增依赖，
+# 「新版包 + 老 venv」于是静默缺包（zstandard 就是这么漏的——数据库直读少了它
+# 只会少消息、不报错，因为压缩行解不开时按约定跳过）。按 uv.lock 的哈希打戳，
+# 戳不对就原地同步一次（不删 venv，省掉重下 torch）。
+lock_hash="$(shasum -a 256 "$RES/app/uv.lock" 2>/dev/null | awk '{print $1}')"
+if [ "$ready" = 1 ] && [ -n "$lock_hash" ] && [ "$(cat "$LOCK_STAMP" 2>/dev/null)" != "$lock_hash" ]; then
+    log "随包依赖清单与上次启动不同 —— 同步依赖（保留现有 venv）"
+    ready=0
+fi
+
 if [ "$ready" = 0 ]; then
-    rm -rf "$VENV"
-    log "正在创建虚拟环境并安装依赖（需要几分钟，请保持联网）"
-    osascript -e 'display notification "正在准备运行环境（几分钟，需联网）" with title "jev-chat-jarvis"' >/dev/null 2>&1
+    if [ "$rebuild" = 1 ]; then
+        rm -rf "$VENV"
+        log "正在创建虚拟环境并安装依赖（需要几分钟，请保持联网）"
+        osascript -e 'display notification "正在准备运行环境（几分钟，需联网）" with title "jev-chat-jarvis"' >/dev/null 2>&1
+    fi
     # --frozen: use the shipped uv.lock exactly, never re-resolve at runtime
     if ! uv sync --frozen --python "@PYTHON_PIN@" --project "$RES/app" --quiet >>"$LOG" 2>&1; then
         die "依赖安装失败，请查看日志"
     fi
     log "依赖安装完成"
+    # 装完才记戳：失败时下次仍会重试，不会把坏环境当成好的
+    [ -n "$lock_hash" ] && print -r -- "$lock_hash" > "$LOCK_STAMP"
 fi
 
 log "启动 hud.py"
@@ -197,6 +220,9 @@ check "锁文件进包（uv.lock）"        "[ -f '$APP/Contents/Resources/app/u
 check "uv 安装脚本进包"             "[ -f '$APP/Contents/Resources/app/packaging/bootstrap_uv.sh' ]"
 check "Python 版本进包"             "[ -f '$APP/Contents/Resources/app/.python-version' ]"
 check "许可证进包（MIT）"           "[ -f '$APP/Contents/Resources/app/LICENSE' ]"
+check "密钥提取工具进包（数据源 db）"  "[ -f '$APP/Contents/Resources/app/tools/wcdb_key_tool/wcdb_key_tool_macos.py' ]"
+check "第三方许可进包（MIT）"        "[ -f '$APP/Contents/Resources/app/tools/wcdb_key_tool/LICENSE' ]"
+check "提取入口可执行"              "[ -x '$APP/Contents/Resources/app/tools/extract_wechat_keys.command' ]"
 check "依赖版本已冻结到 $PY_PIN"     "grep -q '${PY_PIN}' '$APP/Contents/Resources/launcher.zsh'"
 check "没夹带缓存"                  "[ ! -d '$APP/Contents/Resources/app/src/__pycache__' ]"
 # a key that leaked into src/ would ship to whoever gets the bundle. src/builtin.py is the

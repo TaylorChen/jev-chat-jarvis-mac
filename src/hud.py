@@ -72,6 +72,7 @@ from judge import make_judge  # noqa: E402
 from generate import BUILTIN_SOURCE, Generator, load_credentials  # noqa: E402
 import styles  # noqa: E402
 import fill  # noqa: E402
+import wechat_keys  # noqa: E402
 
 PANEL_W, PANEL_H = 360, 614   # tall enough for 3-line candidates + the chat name row
 COLLAPSED_H = 96              # height when the panel is rolled up
@@ -205,6 +206,11 @@ class _BoxesView(NSView):
 
 
 class HudController(NSObject):
+    def initWithSource_(self, source):
+        """`--source ocr|db` 从 main() 传进来；不传则按配置解析（见 userconfig）。"""
+        self._cli_source = source
+        return self.init()
+
     def init(self):
         self = objc.super(HudController, self).init()
         if self is None:
@@ -220,6 +226,32 @@ class HudController(NSObject):
         self._read_once = False        # first OCR call includes Vision's own load
         self._last_skip_reason = None
         self.judge = make_judge()
+        # 数据源：db（默认，读微信本地库）或 ocr（读屏）。可配置，也能用 --source 临时覆盖。
+        # db 需要先用 tools/extract_wechat_keys.command 提取密钥；回退与原因都在
+        # wechat_keys.resolve_source 里定，这里只落地面板状态 + 记下「想用 db 却退回」
+        # 这件事（启动时用它提示用户，否则会以为设了 db 却在读屏）。
+        requested_source = userconfig.perception_source(getattr(self, "_cli_source", None))
+        self._source, source_note = wechat_keys.resolve_source(
+            getattr(self, "_cli_source", None))
+        self._fell_back_to_ocr = (self._source == "ocr" and requested_source == "db")
+        if source_note:
+            _log(source_note)
+        self._db_mode = False
+        self._db_reader = None
+        self._db_read_count = 0     # DB 模式：这一跳读到的历史条数（面板上给用户看）
+        self._pin_label = ""        # 手动钉住的会话名（空 = 自动跟随你点开的）
+        if self._source == "db":
+            try:
+                from perception_db import DBReader
+                self._db_reader = DBReader(
+                    live_dir=wechat_keys.live_dir(),
+                    keys_file=wechat_keys.keys_file(),
+                    watch=userconfig.get("JEV_DB_WATCH") or "follow")
+                self._db_mode = True
+                _log(f"感知模式: 数据库直读（live DB）— OCR 已停用 · {wechat_keys.status_line()}")
+            except Exception as e:
+                _log(f"DB 感知初始化失败，回退 OCR: {type(e).__name__}: {str(e)[:60]}")
+                self._source = "ocr"
         self.generator = Generator()
         # 话术: per-slot tone selection. A slot on 不用 contributes no request and no rows,
         # so the panel is exactly as tall as the groups actually in use.
@@ -275,6 +307,10 @@ class HudController(NSObject):
         # either way the menu-bar item flips it at runtime
         self._show_boxes = userconfig.get("JEV_BOXES").strip().lower() in (
             "1", "true", "yes", "on")
+        if self._show_boxes and self._db_mode:
+            # 数据库直读的消息没有屏幕几何（x/w=0，applyBoxes_ 会跳过），只有输入目标
+            # 框还有意义；说一句，免得用户开着重叠框却看不到消息框以为坏了
+            _log("数据库直读没有屏幕坐标：检测框只能画输入目标，消息框要看就用 --source ocr")
         self._last_risk = 0.0         # newest verdict's risk, for the overlay's highlight
         self._chat_title = ""
         self._asked_permission = False
@@ -335,18 +371,52 @@ class HudController(NSObject):
         self.settings_button.setHidden_(False)
         view.addSubview_(self.settings_button)
         self._fixed.append((self.settings_button, PANEL_W - 42, 24, 28, 28))
+        # 「查看读到的消息」也要在面板上有一个入口：菜单栏 J 里那个是给知道它的人用的，
+        # 而「判断到底读了什么」正是面板上的疑问，让人不必去翻菜单栏
+        self.messages_button = self._make_button(PANEL_W - 72, 0, 28, 28,
+                                                "", "openMessages:", 0)
+        self.messages_button.setImage_(AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "list.bullet.rectangle", "查看读到的消息"))
+        self.messages_button.setImagePosition_(AppKit.NSImageOnly)
+        self.messages_button.setBordered_(False)
+        self.messages_button.setContentTintColor_(PALETTE["muted"])
+        self.messages_button.setToolTip_("查看读到的消息（数据库直读=本地库历史）")
+        self.messages_button.setAccessibilityLabel_("查看读到的消息")
+        self.messages_button.setHidden_(False)
+        view.addSubview_(self.messages_button)
+        self._fixed.append((self.messages_button, PANEL_W - 72, 24, 28, 28))
+        # 「跟随会话」也要能直接从面板点开：微信不记录当前会话（点开无未读的会话没有任何
+        # 痕迹），所以「盯住这个会话」必须让用户显式选——藏在菜单栏里等于没有
+        self.pin_button = self._make_button(PANEL_W - 102, 0, 28, 28,
+                                           "", "openSessions:", 0)
+        self.pin_button.setImage_(AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            "pin", "跟随会话"))
+        self.pin_button.setImagePosition_(AppKit.NSImageOnly)
+        self.pin_button.setBordered_(False)
+        self.pin_button.setContentTintColor_(PALETTE["muted"])
+        self.pin_button.setToolTip_("跟随会话：微信不记录你点开的无未读会话，这里手动选")
+        self.pin_button.setAccessibilityLabel_("跟随会话")
+        self.pin_button.setHidden_(False)
+        view.addSubview_(self.pin_button)
+        self._fixed.append((self.pin_button, PANEL_W - 102, 24, 28, 28))
         dy = 30
         for key, size, color, bold, height in (
             ("chat", 12, PALETTE["green"], True, 18),      # 群名 / 联系人
             ("status", 10, PALETTE["muted"], False, 14),
             ("message", 15, PALETTE["text"], False, 50),      # the message under analysis
             ("sender", 10, PALETTE["muted"], False, 14),
+            # 这一眼用的上下文是哪一段（起止时间 + 条数），以及 JEV 什么时候被触发。
+            # 用户要能自己核对「喂进去的历史」和「什么时候真的问了模型」，所以单独占两行，
+            # 不塞进 sender 那行（那行常被长群名挤掉）
+            ("span", 10, PALETTE["muted"], False, 14),
+            ("trigger", 10, PALETTE["muted"], False, 14),
             ("intent", 21, PALETTE["text"], True, 28),
             ("confidence", 12, PALETTE["muted"], False, 18),
             ("risk", 14, PALETTE["green"], True, 20),
             ("actions", 13, PALETTE["text"], False, 18),
         ):
-            width = PANEL_W - 68 if key == "chat" else PANEL_W - 28
+            # 标题让出三个按钮的位置，否则长群名会钻到按钮底下
+            width = PANEL_W - 134 if key == "chat" else PANEL_W - 28
             tf = self._make_label(14, 0, width, height,
                                   size=size, color=color, bold=bold)
             if key == "message":
@@ -543,6 +613,7 @@ class HudController(NSObject):
             ("暂停读屏", "togglePause:", ""),
             ("YOLO 检测框", "toggleBoxes:", ""),
             ("立即重新分析", "reanalyze:", ""),
+            ("查看读到的消息…", "openMessages:", ""),
             ("模型设置…", "openSettings:", ","),
         ):
             menu.addItemWithTitle_action_keyEquivalent_(title, action, key)
@@ -554,7 +625,106 @@ class HudController(NSObject):
         self.boxes_item = menu.itemArray()[2]
         self.boxes_item.setState_(
             AppKit.NSOnState if self._show_boxes else AppKit.NSOffState)
+        # 「跟随会话」子菜单：微信不为「点开一个没有未读的会话」写任何痕迹（实测：
+        # 点开未读=0 的会话后 last_clear_unread_timestamp 原地不动），AX 也读不到会话
+        # 列表（微信只暴露窗口按钮），所以「我想一直盯着这个会话」只能由用户显式指定。
+        # 插在「查看读到的消息…」之后：前两项（暂停/检测框）的下标保持不变。
+        self.pin_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "跟随会话", "", "")
+        self.pin_menu = AppKit.NSMenu.alloc().initWithTitle_("跟随会话")
+        self.pin_menu.setDelegate_(self)
+        self.pin_item.setSubmenu_(self.pin_menu)
+        menu.insertItem_atIndex_(self.pin_item, 6)
         self.status_item.setMenu_(menu)
+
+    def menuNeedsUpdate_(self, menu):
+        """打开「跟随会话」时重建列表：会话顺序一直在变，缓存没有意义。"""
+        if menu is not self.pin_menu or self._db_reader is None:
+            return
+        menu.removeAllItems()
+        auto = menu.addItemWithTitle_action_keyEquivalent_(
+            "自动（跟随你点开的会话）", "pinSession:", "")
+        auto.setTarget_(self)
+        auto.setRepresentedObject_(None)
+        if not self._db_reader.pin:
+            auto.setState_(AppKit.NSOnState)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+        for username, label in self._recent_sessions(20):
+            item = menu.addItemWithTitle_action_keyEquivalent_(label, "pinSession:", "")
+            item.setTarget_(self)
+            item.setRepresentedObject_(username)
+            if self._db_reader.pin == username:
+                item.setState_(AppKit.NSOnState)
+
+    @objc.python_method
+    def _recent_sessions(self, n: int = 20) -> list:
+        """最近活跃的会话（跳过公众号），用于「跟随会话」列表。"""
+        reader = getattr(self, "_db_reader", None)
+        if reader is None:
+            return []
+        provider = reader.provider
+        rows = provider._query(
+            "session/session.db",
+            "SELECT username, unread_count AS u FROM SessionTable "
+            "WHERE last_clear_unread_timestamp > 0 OR unread_count > 0 "
+            f"ORDER BY sort_timestamp DESC LIMIT {int(n)}")
+        out = []
+        for r in rows:
+            if provider.category(r["username"]) == "公众号":
+                continue
+            unread = int(r.get("u") or 0)
+            label = provider.display_name(r["username"])[:22]
+            out.append((r["username"], f"{label}（{unread} 条未读）" if unread else label))
+        return out
+
+    def pinSession_(self, sender):
+        """菜单里的「跟随会话」：sender 带 representedObject = username（空 = 自动）。"""
+        self._apply_pin(sender.representedObject())
+
+    def openSessions_(self, sender):
+        """面板上的「跟随会话」按钮：列出最近活跃会话，点一行即跟随。"""
+        reader = getattr(self, "_db_reader", None)
+        if reader is None:
+            self._render("status", "读屏模式没有会话列表：「跟随会话」需要数据库直读",
+                         PALETTE["muted"])
+            return
+        import session_picker
+        rows = self._pin_rows()
+        picker = getattr(self, "session_picker", None)
+        if picker is None:
+            self.session_picker = session_picker.SessionPicker.alloc() \
+                .initWithTitle_rows_onPick_("跟随哪个会话", rows, self._apply_pin)
+        else:
+            picker.reload(rows)
+        self.session_picker.show()
+
+    @objc.python_method
+    def _pin_rows(self) -> list:
+        """选择列表：[("", 自动…), (username, 会话名（N 条未读）), …]。"""
+        rows = [("", "自动 · 跟随你点开的会话（只对他有未读的会话有效）")]
+        if getattr(self, "_db_reader", None) is not None:
+            rows += self._recent_sessions(30)
+        return rows
+
+    @objc.python_method
+    def _apply_pin(self, username):
+        """钉住 / 取消钉住（菜单与选择窗口共用）。"""
+        reader = getattr(self, "_db_reader", None)
+        if reader is None:
+            self._render("status", "读屏模式没有会话列表：「跟随会话」需要数据库直读",
+                         PALETTE["muted"])
+            return
+        username = username or None
+        reader.set_pin(username)
+        self._pin_label = reader.provider.display_name(username) if username else ""
+        # 让下一跳立刻重读、并按「切换会话」处理，面板马上跟过去
+        self._next_read_ts = 0
+        self._fingerprint = None
+        self.last_seen = None
+        self._push("applySource:", self._source_badge())
+        self._render("status", f"已跟随「{self._pin_label}」" if username
+                     else "已恢复：跟随你点开的会话", PALETTE["muted"])
+        _log(f"跟随会话: {self._pin_label or '自动'}")
 
     def openSettings_(self, sender):
         from settings import SettingsController
@@ -568,6 +738,120 @@ class HudController(NSObject):
             alert = AppKit.NSAlert.alloc().init()
             alert.setMessageText_("无法读取配置文件，请检查文件权限。")
             alert.runModal()
+
+    @objc.python_method
+    def _source_badge(self) -> str:
+        """面板标题上的数据源/条数：这是「到底在读库还是读屏」最短的答案。
+
+        放在窗口标题而不是行内：行内那句（sender 行）经常被长群名挤掉，而这个问题
+        用户会反复问（「是不是还在 OCR」），必须一直看得见。
+        """
+        if not self._db_mode:
+            return "jev-jarvis · OCR 读屏"
+        n = len(getattr(self, "_last_msgs", None) or [])
+        base = f"jev-jarvis · 数据库直读 {n} 条" if n else "jev-jarvis · 数据库直读"
+        return base + (" · 手动" if getattr(self, "_pin_label", "") else "")
+
+    @objc.python_method
+    def _window_text(self) -> str:
+        """面板那行「历史窗口」：这段上下文的起止时间与条数。
+
+        用户要的就是「我看的这一眼是哪一段历史」——条数已经在标题栏，这里给时间范围，
+        一眼能对上「是刚才还是上午」。读屏模式没有时间戳，就照实说。
+        """
+        msgs = getattr(self, "_last_msgs", None) or []
+        stamps = sorted(int(getattr(m, "ts", 0) or 0) for m in msgs)
+        stamps = [t for t in stamps if t]
+        if not stamps:
+            return f"屏幕可见 {len(msgs)} 条 · 读屏无时间戳" if msgs else ""
+        first, last = stamps[0], stamps[-1]
+        same_day = time.strftime("%m-%d", time.localtime(first)) == \
+            time.strftime("%m-%d", time.localtime(last))
+        left = time.strftime("%m-%d %H:%M", time.localtime(first))
+        right = time.strftime("%H:%M", time.localtime(last)) if same_day \
+            else time.strftime("%m-%d %H:%M", time.localtime(last))
+        return f"历史 {left} → {right} · {len(msgs)} 条"
+
+    @objc.python_method
+    def _trigger_text(self, phase: str = "waiting", detail: str = "") -> str:
+        """面板那行「JEV 触发」：现在处于哪个阶段、上一次是什么时候问的模型。
+
+        waiting = 还没有对方消息；fired = 刚到消息、已经同时起跑预判+生成；
+        done = 判断返回了。让「什么时候真的调用 JEV」在面板上可见，而不是只能翻日志。
+        """
+        clock = time.strftime("%H:%M:%S")
+        if phase == "fired":
+            return f"JEV 已触发 {clock} · 停稳 {SETTLE_S}s 后上屏{detail}"
+        if phase == "done":
+            return f"JEV 判定完成 {clock}{detail}"
+        if phase == "pending":
+            return f"JEV 判定中…（{clock}）{detail}"
+        return f"等待对方消息 · 到达即触发 JEV 预判（停稳 {SETTLE_S}s 上屏）"
+
+    @objc.python_method
+    def _render_meta(self, key: str, text: str):
+        """写面板的元信息行；测试夹具里没有这些行时安静跳过。"""
+        if key in getattr(self, "rows", {}):
+            self._render(key, text, PALETTE["muted"])
+
+    def applyWindow_(self, text):
+        self._render_meta("span", text)
+
+    def applyTrigger_(self, text):
+        self._render_meta("trigger", text)
+
+    def applySource_(self, text):
+        panel = getattr(self, "panel", None)
+        if panel is not None:
+            panel.setTitle_(text)
+
+    @objc.python_method
+    def _message_rows(self):
+        """这一跳读到的消息 → 查看窗口用的行（时间/方向/发送者/正文）。"""
+        return [(getattr(m, "ts", 0), m.side, m.sender, m.text)
+                for m in (getattr(self, "_last_msgs", None) or [])]
+
+    def openMessages_(self, sender):
+        """菜单「查看读到的消息…」：把判断实际拿到的上下文原样列出来。
+
+        数据库直读时这就是本地库里的真实历史（默认 100 条）；读屏时是这一帧认到的
+        那几条。窗口开着时每次读完自动刷新（_refresh_message_view），不用反复重开。
+        """
+        msgs = getattr(self, "_last_msgs", None) or []
+        if not msgs:
+            self._render("status", "还没有读到消息", PALETTE["muted"])
+            return
+        import message_view
+        title = getattr(self, "_last_chat", "")
+        budget = self._context_budget(msgs)
+        viewer = getattr(self, "message_viewer", None)
+        if viewer is None:
+            self.message_viewer = message_view.MessageViewer.alloc() \
+                .initWithTitle_rows_budget_(title, self._message_rows(), budget)
+        else:
+            viewer.reload(title, self._message_rows(), budget)
+        self.message_viewer.show()
+
+    @objc.python_method
+    def _refresh_message_view(self):
+        """查看窗口开着时，每读完一跳就刷新它。
+
+        只投递选择器、**不在这里碰控件**：_work_inner 跑在读线程上（tick_ 每次开一个
+        threading.Thread），而 AppKit 的控件只能在主线程动。之前直接 reload()，
+        用户一点开窗口，下一跳就把整个应用卡住（实测）。真正的刷新在 applyMessages_。
+        """
+        if getattr(self, "message_viewer", None) is None:
+            return
+        self._push("applyMessages:", None)
+
+    def applyMessages_(self, _payload=None):
+        """主线程：查看窗口可见时按最新的读取结果重画（不可见就什么都不做）。"""
+        viewer = getattr(self, "message_viewer", None)
+        if viewer is None or not viewer.window.isVisible():
+            return
+        msgs = getattr(self, "_last_msgs", None) or []
+        viewer.reload(getattr(self, "_last_chat", ""), self._message_rows(),
+                      self._context_budget(msgs))
 
     @objc.python_method
     def _make_label(self, x, y, w, h, size=13, color=None, bold=False):
@@ -607,6 +891,8 @@ class HudController(NSObject):
             parts.append(f"来自 {sender}")
         if prev:
             parts.append(f"上文：{prev[:26]}")
+        if getattr(self, "_db_mode", False) and getattr(self, "_db_read_count", 0):
+            parts.append(f"已读 {self._db_read_count} 条历史")
         return " · ".join(parts)
 
     @objc.python_method
@@ -1001,20 +1287,32 @@ class HudController(NSObject):
 
     @objc.python_method
     def _work_inner(self):
-        if not screen_capture_ok():
-            if not self._asked_permission:
-                self._asked_permission = True
-                request_screen_capture()      # opens the system prompt
-            self._push("applyError:", "需要屏幕录制权限 · 系统设置 › 隐私与安全性")
-            self._next_read_ts = time.time() + SLOW_TICK
-            return
-        try:
-            res = read_conversation(previous_wid=self._win_wid,
-                                    prev_fingerprint=self._fingerprint)
-        except Exception as e:
-            self._push("applyError:", f"读取失败: {type(e).__name__}: {str(e)[:40]}")
-            self._next_read_ts = time.time() + SLOW_TICK
-            return
+        if self._db_mode:
+            # 数据库直读模式：消息来自 live 加密库，不走屏幕 OCR
+            try:
+                res = self._db_reader.read_conversation(
+                    previous_wid=self._win_wid,
+                    prev_fingerprint=self._fingerprint)
+            except Exception as e:
+                self._push("applyError:", f"DB 读取失败: {type(e).__name__}: {str(e)[:40]}")
+                self._next_read_ts = time.time() + SLOW_TICK
+                return
+            self._db_read_count = len(res["messages"])
+        else:
+            if not screen_capture_ok():
+                if not self._asked_permission:
+                    self._asked_permission = True
+                    request_screen_capture()      # opens the system prompt
+                self._push("applyError:", "需要屏幕录制权限 · 系统设置 › 隐私与安全性")
+                self._next_read_ts = time.time() + SLOW_TICK
+                return
+            try:
+                res = read_conversation(previous_wid=self._win_wid,
+                                        prev_fingerprint=self._fingerprint)
+            except Exception as e:
+                self._push("applyError:", f"读取失败: {type(e).__name__}: {str(e)[:40]}")
+                self._next_read_ts = time.time() + SLOW_TICK
+                return
         if not res["ok"]:
             # WeChat gone or unreadable: the panel and the YOLO overlay go with it
             # (applyHidden_ existed for exactly this but was never wired — the panel used
@@ -1058,10 +1356,19 @@ class HudController(NSObject):
         res = dict(res, window=live_window)
         # AX traversal stays on the read worker, never the Cocoa drawing thread.
         now_input = time.monotonic()
-        if (res["window"] != getattr(self, "_input_window", None)
+        if res["window"].get("synthetic"):
+            # 数据库模式下列不到微信窗口（最小化/不在屏上）：没有真实几何，AX 定位和
+            # 视觉兜底都无从谈起——视觉兜底还会每秒截一次屏（DB 模式本就不该要截屏权限）
+            self._input_target = {"box": None, "rect": None, "window": res["window"],
+                                  "reason": "数据库模式：微信窗口不在屏幕上"}
+        elif (res["window"] != getattr(self, "_input_window", None)
                 or now_input >= getattr(self, "_input_next", 0)):
             self._input_target = fill.locate_input(res["window"])
-            if self._input_target["box"] is None:
+            if self._input_target["box"] is None and not self._db_mode:
+                # 视觉兜底要**截屏**（capture_image + chat_signature）。数据库直读承诺
+                # 不碰屏幕、不需要录屏权限，所以这条路只在读屏模式下走：否则 AX 定位
+                # 失败时每秒截一次屏，菜单栏会一直挂「正在捕捉你的屏幕」——实测被用户
+                # 当场抓到，并因此以为还在用 OCR。
                 from input_region import locate_visual_input
                 self._input_target["visual_rect"] = locate_visual_input(res["window"])
                 if self._input_target["visual_rect"]:
@@ -1073,6 +1380,12 @@ class HudController(NSObject):
         thems = [m for m in msgs if m.side == "them"]
         newest = thems[-1] if thems else None
         prev_text = thems[-2].text if len(thems) > 1 else ""
+        # 留给「查看读到的消息…」：读到的原样消息 + 会话名，菜单里点开即可核对判断喂了什么
+        self._last_msgs = msgs
+        self._last_chat = res.get("chat_title") or ""
+        self._push("applySource:", self._source_badge())   # 标题上写清库/屏 + 条数
+        self._push("applyWindow:", self._window_text())    # 这一眼用的是哪一段历史
+        self._refresh_message_view()
 
         key = (res.get("chat_title") or "", newest.text) if newest else None
         if key != self._reply_key:
@@ -1103,28 +1416,39 @@ class HudController(NSObject):
             t = res.get("timing_ms") or {}
             first_read = not self._read_once
             self._read_once = True
-            # Vision loads on the first call and costs ~2x steady state; saying so keeps a
-            # one-off from being read as a regression (same reason the judge line does it)
-            note = "（首次，含 Vision 加载）" if first_read and t.get("ocr", 0) > 400 else ""
-            # say when the fast in-process capture was refused: otherwise a permanent
-            # fallback looks like ordinary slowness instead of something to report
-            slow_cap = " · 抓屏走了子进程（进程内被抓图接口拒绝）" \
-                if t.get("capture_path") == "subprocess" else ""
-            _log(f"读屏 抓取 {t.get('capture', 0):.0f}ms + OCR {t.get('ocr', 0):.0f}ms"
-                 f" = {t.get('total', 0):.0f}ms · 读到 {len(msgs)} 条（对方 {len(thems)} 条）"
-                 f"{note}{slow_cap}")
+            # 上下文条数写进日志：判断到底喂了多少历史，是「用没用上数据库」唯一的客观凭证
+            budget = self._context_budget(msgs)
+            ctx_note = (f" · 上下文 {budget} 条" if budget
+                        else f" · 上下文按轮次（判 {JUDGE_TURNS}/生成 {CONTEXT_TURNS} 条）")
+            if self._db_mode:
+                # 没有抓屏也没有 OCR：照 OCR 那行打会变成「抓取 0ms + OCR 0ms」，
+                # 日志是唯一的排查面，不能报不存在的阶段
+                _log(f"读库 {t.get('db', 0):.0f}ms · 读到 {len(msgs)} 条"
+                     f"（对方 {len(thems)} 条）· 会话「{res.get('chat_title') or '?'}」{ctx_note}")
+            else:
+                # Vision loads on the first call and costs ~2x steady state; saying so keeps
+                # a one-off from being read as a regression (same reason the judge line does)
+                note = "（首次，含 Vision 加载）" if first_read and t.get("ocr", 0) > 400 else ""
+                # say when the fast in-process capture was refused: otherwise a permanent
+                # fallback looks like ordinary slowness instead of something to report
+                slow_cap = " · 抓屏走了子进程（进程内被抓图接口拒绝）" \
+                    if t.get("capture_path") == "subprocess" else ""
+                _log(f"读屏 抓取 {t.get('capture', 0):.0f}ms + OCR {t.get('ocr', 0):.0f}ms"
+                     f" = {t.get('total', 0):.0f}ms · 读到 {len(msgs)} 条（对方 {len(thems)} 条）"
+                     f"{note}{slow_cap}{ctx_note}")
+            self._push("applyTrigger:", self._trigger_text("fired"))
             _log(f"新消息 · 预判+生成先跑，停稳 {SETTLE_S}s（连续 {STABLE_READS} 跳不变最早 "
                  f"{EARLY_SETTLE_S}s）后上屏（两次完整分析最小间隔 {MIN_GAP_S}s）")
             # latest-wins: overwrite the slot, retire the old verdict — only the newest
             # text's judgment can ever be consumed, and only by the settle gate below
-            self._prejudge_req = (newest.text, self._context_text(msgs, newest, JUDGE_TURNS),
+            self._prejudge_req = (newest.text, self._context_for(msgs, newest, judge=True),
                                   newest.sender, prev_text, self._reply_epoch)
             self._prejudge_result = None
             self._prejudge_event.set()
             # same discipline for the generation half: fire now, supersede on the next
             # arrival, spend at settle. Tones are captured here — a dropdown click during
             # the window invalidates the result at consumption time (checked in _take_pregen)
-            self._pregen_req = (newest.text, self._context_text(msgs, newest),
+            self._pregen_req = (newest.text, self._context_for(msgs, newest, judge=False),
                                 tuple(self.slot_tones), self._reply_epoch)
             self._pregen_result = None
             self._pregen_event.set()
@@ -1222,6 +1546,8 @@ class HudController(NSObject):
                     first = not self._judged_once
                     self._judged_once = True
                     note = "（首次，含本地模型加载）" if first else ""
+                    self._push("applyTrigger:",
+                               self._trigger_text("done", f" · {ms:.0f}ms"))
                     _log(f"预判 {ms:.0f}ms → {verdict.get('intent', '?')}"
                          f" 把握 {verdict.get('confidence', 0):.0%}"
                          f" 风险 {verdict.get('risk', '?')}{note}（待停稳上屏）")
@@ -1351,9 +1677,12 @@ class HudController(NSObject):
         talking, and whether the last thing said was mine. One-to-one chats render no name
         above the bubble, so 我/对方 stands in.
 
-        The halves take different depths: generation needs the conversational thread
-        (CONTEXT_TURNS), while the judge's prompt is paid per forward — two turns carry
-        most of the signal at roughly half the added prefill (JUDGE_TURNS).
+        `turns` is a **message count**, not a round-trip count (it was named for the
+        我/对方 alternation it usually looks like). How many to take is decided by
+        _context_for: by default the halves differ (generation CONTEXT_TURNS, judge
+        JUDGE_TURNS — the judge's prompt is paid per forward, and two turns carry most of
+        the signal at roughly half the prefill), but 数据库直读 overrides both with the
+        whole loaded history, because that is the point of reading the database.
 
         The message under judgment is excluded **by identity**, not by position: `newest` is
         the last message from the other side, which is not the same as the last element of
@@ -1367,6 +1696,32 @@ class HudController(NSObject):
             for m in prior)
 
     @objc.python_method
+    def _context_budget(self, msgs) -> int:
+        """上下文用多少条消息；0 = 沿用按轮次的默认（JUDGE_TURNS / CONTEXT_TURNS）。
+
+        优先级：JEV_CONTEXT_MESSAGES 给了数字就用它；其次 JEV_DB_HISTORY=1（早期
+        实验开关，语义就是「拿本地库的历史当上下文」）；再其次，数据库直读默认用读到的
+        **全部**真实历史——「基于最近 N 条判断」正是它相对读屏的主要价值，读屏那边只有
+        屏幕上的几条，所以保持按轮次的省 prefill 默认。
+
+        上限 400 条：再多的 prefill 只会拖慢判断，而读到的量本来由 reader 的
+        context_limit（100）决定。
+        """
+        raw = userconfig.get("JEV_CONTEXT_MESSAGES").strip()
+        if raw.isdigit():
+            return min(int(raw), 400)
+        if userconfig.get("JEV_DB_HISTORY").strip() == "1":
+            return min(len(msgs), 400)
+        return min(len(msgs), 400) if self._db_mode else 0
+
+    @objc.python_method
+    def _context_for(self, msgs, newest, judge: bool) -> str | None:
+        """判断/生成各自该拿到的上下文（见 _context_budget）。"""
+        budget = self._context_budget(msgs)
+        return self._context_text(msgs, newest,
+                                  budget or (JUDGE_TURNS if judge else CONTEXT_TURNS))
+
+    @objc.python_method
     def _analyze(self, newest, msgs, prev_text: str = ""):
         """Judge and generate in parallel, then rank. Judgment lands on screen first.
 
@@ -1376,7 +1731,7 @@ class HudController(NSObject):
         import concurrent.futures as cf
 
         t0 = time.perf_counter()
-        context = self._context_text(msgs, newest)
+        context = self._context_for(msgs, newest, judge=False)
         with cf.ThreadPoolExecutor(max_workers=2) as ex:
             # generation does not need the intent, so it runs while judging; it prefers an
             # early run that started at detection time (_gen_with_pregen) — only a miss
@@ -1389,7 +1744,7 @@ class HudController(NSObject):
             try:
                 with self._model_lock:   # never two local forwards at once
                     verdict = self.judge.judge(
-                        newest.text, context=self._context_text(msgs, newest, JUDGE_TURNS))
+                        newest.text, context=self._context_for(msgs, newest, judge=True))
                 ms = (time.perf_counter() - t_judge) * 1000
                 first = not self._judged_once
                 self._judged_once = True
@@ -1496,6 +1851,7 @@ class HudController(NSObject):
             self._render(key, "", PALETTE["muted"])
         self.rows["cand_header"].setStringValue_("候选回复")
         self._render("status", "等待可确认的对方消息…", PALETTE["muted"])
+        self._render_meta("trigger", self._trigger_text("waiting"))
 
     # --- main-thread callbacks (AppKit is not thread safe)
     def applyChat_(self, title):
@@ -1687,14 +2043,20 @@ class HudController(NSObject):
         second, the slow one after. If a message does land mid-warm-up nothing breaks:
         its judge() blocks on the model's load lock until the warm-up finishes, and the
         OCR warm-up is independent of WeChat entirely (a blank canvas, not a window).
+
+        数据库直读不碰屏幕：这里跳过 Vision。之前照旧预热并打「预热 OCR 就绪」，
+        让用户以为还在读屏（真实发生过），日志必须只讲这次真的用到的阶段。
         """
         t0 = time.perf_counter()
-        ocr_ms = warm_ocr()
-        if ocr_ms >= 0:
-            self._read_once = True    # Vision's one-off load is paid; first read is steady-state
-            _log(f"预热 OCR 就绪 · {ocr_ms:.0f}ms")
+        if self._db_mode:
+            self._read_once = True    # 没有 Vision 的一次性加载
         else:
-            _log("预热 OCR 失败 · 首次读屏会稍慢，不影响使用")
+            ocr_ms = warm_ocr()
+            if ocr_ms >= 0:
+                self._read_once = True    # Vision's one-off load is paid; first read is steady-state
+                _log(f"预热 OCR 就绪 · {ocr_ms:.0f}ms")
+            else:
+                _log("预热 OCR 失败 · 首次读屏会稍慢，不影响使用")
 
         try:
             self.judge.warm()
@@ -1744,15 +2106,43 @@ def warn_if_no_generation_key() -> None:
         pass          # no osascript: the panel still shows the hint in the candidate area
 
 
+def warn_if_db_without_keys():
+    """数据源是数据库直读、但还没提取密钥：本次自动退回 OCR，并说清怎么补上。
+
+    默认数据源就是 db，所以这不是用户做错了什么，只是提取那一步还没跑。不说明白，
+    用户只会看到「明明设了 db 却在读屏」。同样走 osascript：见 warn_if_no_generation_key
+    里关于 NSAlert 在那个上下文不可用的记录。窗口不阻塞（Popen 不等待）。
+    """
+    from pathlib import Path as _Path
+    command = str(wechat_keys.EXTRACT_COMMAND).replace(str(_Path.home()), "~")
+    env_path = str(userconfig.ENV_FILE).replace(str(_Path.home()), "~")
+    script = (
+        'display alert "数据库直读还没有密钥，本次已退回 OCR 读屏" message "'
+        "数据库直读要用你自己的密钥只读打开微信的本地库，需要先提取一次：\\n"
+        "会给微信做一次 ad-hoc 重签名，再 sudo 提取，首次还要在微信里退出登录再登录。\\n\\n"
+        f"在终端里运行：\\n{command}\\n\\n"
+        f"只想用读屏就在 {env_path} 里写 JEV_SOURCE=ocr，"
+        '或在「模型设置 → 感知 · 数据源」里选「OCR 读屏」。" as informational'
+    )
+    try:
+        subprocess.Popen(["osascript", "-e", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass          # 没有 osascript 时日志里那行回退说明仍然在
+
+
 def main() -> None:
     app = AppKit.NSApplication.sharedApplication()
     app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
     warn_if_no_generation_key()
-    controller = HudController.alloc().init()
+    controller = HudController.alloc().initWithSource_(userconfig.source_arg(sys.argv[1:]))
+    if getattr(controller, "_fell_back_to_ocr", False) and not wechat_keys.has_keys():
+        warn_if_db_without_keys()
     # First line of every run: which backends are actually in play. Support requests
     # always need it, and it proves the log is live before the first message arrives.
     _base, _key, _model, _src, _api = load_credentials()
-    _log(f"启动 · 判断层 "
+    _log(f"启动 · 数据源 {'数据库直读' if controller._db_mode else 'OCR 读屏'}"
+         f" · 判断层 "
          f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY') else '本地 decider-2b'}"
          f" · 生成层 {(_base + ' / ' + _model) if _key else '未配置（候选区会是空的）'}"
          + ("（内置默认）" if _src == BUILTIN_SOURCE else "")

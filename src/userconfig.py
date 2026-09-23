@@ -212,3 +212,45 @@ def where() -> str:
         if parse_env_file(f):
             return str(f)
     return "（未找到配置文件）"
+
+
+# ---- 感知数据源（OCR 读屏 / 数据库直读）----------------------------------------
+
+PERCEPTION_SOURCES = ("ocr", "db")
+DEFAULT_PERCEPTION_SOURCE = "db"
+
+
+def source_arg(argv: list[str]) -> str | None:
+    """Read `--source ocr|db` (also `--source=db`) out of argv; None when absent.
+
+    Only this one switch is parsed: the app is normally launched by double-clicking, and
+    a hand-rolled flag parser here would be a second, quietly diverging CLI.
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--source":
+            return argv[i + 1] if i + 1 < len(argv) else ""
+        if arg.startswith("--source="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def perception_source(cli: str | None = None) -> str:
+    """Which sense to use: 'db' (default, read-only read of WeChat's own database) or
+    'ocr' (screen capture + Vision).
+
+    Precedence: command line > JEV_SOURCE from the environment/config file > the legacy
+    JEV_DB_MODE=1 switch > the default. The default is db because it is the better
+    source when it is available at all: real conversation history instead of whatever
+    happens to be on screen, no screen-recording permission, and messages that arrive
+    while the pane is scrolled away are still seen. It is not unconditional — with no
+    extracted keys the caller falls back to ocr (see wechat_keys.resolve_source), so an
+    install that never ran the key extraction still works, just less well.
+    """
+    if cli:
+        return cli.strip().lower()
+    value = get("JEV_SOURCE").strip().lower()
+    if value:
+        return value
+    if get("JEV_DB_MODE").strip() == "1":
+        return "db"            # 旧开关，仍认；新配置请用 JEV_SOURCE=db
+    return DEFAULT_PERCEPTION_SOURCE

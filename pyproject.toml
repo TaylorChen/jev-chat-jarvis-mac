@@ -13,4 +13,5 @@ dependencies = [
     "pyobjc-framework-vision>=12.2.2",
     "torch>=2.14.0",
     "transformers>=5.17.0",
+    "zstandard>=0.23.0",
 ]

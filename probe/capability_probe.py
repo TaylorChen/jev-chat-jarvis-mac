@@ -4,7 +4,10 @@
 Three candidate channels, in order of fidelity:
   A. Accessibility API (AXUIElement)  -> exact structured text, no OCR errors
   B. Screen capture + Vision OCR      -> works always, needs screen-recording permission
-  C. (not probed) SQLite DB decrypt   -> out of scope, WeChat DB is SQLCipher-encrypted
+  C. SQLite DB read via sqlcipher     -> implemented in src/live_db.py + src/perception_db.py
+                                          (opt-in JEV_SOURCE=db;需要先提取密钥，见
+                                          tools/wcdb_key_tool/NOTICE.md)。本探针不测 C：
+                                          它要刻意保持零依赖、零权限要求。
 
 This script reports what is actually available on THIS machine right now.
 """

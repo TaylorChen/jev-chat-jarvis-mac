@@ -19,4 +19,4 @@ if ! jev_ensure_uv "$LOG"; then
     exit 1
 fi
 
-exec uv run python src/hud.py
+exec uv run python src/hud.py "$@"

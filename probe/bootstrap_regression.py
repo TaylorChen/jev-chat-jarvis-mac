@@ -23,10 +23,17 @@ export TMPDIR="$PWD/tmp"
 export FIXTURE_ROOT="$PWD"
 export TRACE="$PWD/trace"
 mkdir -p "$HOME" "$TMPDIR"
-if [ "$SCENARIO" = existing ]; then
-    mkdir -p "$HOME/.local/bin"
-    cp "$FIXTURE_ROOT/uv" "$HOME/.local/bin/uv"
-    chmod +x "$HOME/.local/bin/uv"
+case "$SCENARIO" in
+    existing|existing-venv)
+        mkdir -p "$HOME/.local/bin"
+        cp "$FIXTURE_ROOT/uv" "$HOME/.local/bin/uv"
+        chmod +x "$HOME/.local/bin/uv" ;;
+esac
+# 已有 venv（解释器正确）：用来验证「依赖清单变了要不要重同步」这一条
+if [ "$SCENARIO" = existing-venv ]; then
+    mkdir -p "$HOME/Library/Application Support/jev-jarvis/venv/bin"
+    cp "$FIXTURE_ROOT/python" "$HOME/Library/Application Support/jev-jarvis/venv/bin/python"
+    chmod +x "$HOME/Library/Application Support/jev-jarvis/venv/bin/python"
 fi
 # bash lacks zsh's print builtin. Production script is unchanged.
 if [ -n "${BASH_VERSION:-}" ]; then
@@ -93,13 +100,28 @@ case "$1" in
 esac
 '''
 
+# 记下真正启动了什么、拿到的是哪份配置：venv 版本探测（-c）必须回一个与包内钉住
+# 一致的版本号，否则永远走「重建」分支，锁文件那套逻辑就测不到。
+PYTHON = r'''#!/bin/sh
+if [ "$1" = "-c" ]; then echo 3.12; exit 0; fi
+echo "app-started source=${JEV_SOURCE:-unset}" >> "$TRACE"
+'''
+
+# 随包 uv.lock 的内容无所谓，只要稳定：探针按它的哈希算戳。
+UV_LOCK = "version = 1\n"
+
 
 def write(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8", newline="\n")
 
 
-def run_launcher(scenario, source=False):
+def run_fixture(scenario, source=False, prepare=None, env_extra=None):
+    """跑一次启动脚本，返回 (completed, trace, log, stamp)。
+
+    stamp 是启动脚本写下的依赖戳（tempdir 随函数结束删除，所以在返回前读出来）。
+    prepare(root) 在脚本执行前准备 fixture（写配置、写戳）；env_extra 追加环境变量。
+    """
     with tempfile.TemporaryDirectory(prefix="jev-bootstrap-") as td:
         root = Path(td)
         build = (ROOT / "packaging/build_app.sh").read_text(encoding="utf-8")
@@ -110,6 +132,8 @@ def run_launcher(scenario, source=False):
         app = root / "jev test.app/Contents"
         (app / "Resources/app").mkdir(parents=True)
         write(app / "Resources/launcher.zsh", launcher)
+        # 随包依赖清单：启动脚本按它的哈希决定要不要重新同步依赖
+        write(app / "Resources/app/uv.lock", UV_LOCK)
         write(root / "source/start.command", (ROOT / "start.command").read_text(encoding="utf-8"))
         helper = ROOT / "packaging/bootstrap_uv.sh"
         if helper.exists():
@@ -118,16 +142,34 @@ def run_launcher(scenario, source=False):
                 write(dest, helper.read_text(encoding="utf-8"))
         write(root / "installer", INSTALLER)
         write(root / "uv", UV)
-        write(root / "python", '#!/bin/sh\necho app-started >> "$TRACE"\n')
+        write(root / "python", PYTHON)
+        if prepare:
+            prepare(root)
         target = "source/start.command" if source else "jev test.app/Contents/Resources/launcher.zsh"
         env = dict(os.environ, SCENARIO=scenario)
+        # 外层环境里的 XDG 配置目录不许漏进 fixture：生产脚本会优先读它，
+        # 否则「默认读 ~/.config」这条断言会随开发者机器而变。
+        env.pop("XDG_CONFIG_HOME", None)
+        env.update(env_extra or {})
         # Use a relative path so Git Bash and native POSIX shells share the same fixture.
         completed = subprocess.run([SHELL, "-c", PRELUDE, target, target], cwd=root, env=env,
                                    capture_output=True, text=True, encoding="utf-8", timeout=15)
         trace = (root / "trace").read_text(encoding="utf-8") if (root / "trace").exists() else ""
         log = root / "home/Library/Logs/jev-jarvis.log"
         detail = log.read_text(encoding="utf-8") if log.exists() else ""
-        return completed, trace, detail
+        stamp_path = root / "home/Library/Application Support/jev-jarvis/uv.lock.sha256"
+        stamp = stamp_path.read_text(encoding="utf-8").strip() if stamp_path.exists() else None
+        return completed, trace, detail, stamp
+
+
+def run_launcher(scenario, source=False):
+    completed, trace, detail, _stamp = run_fixture(scenario, source=source)
+    return completed, trace, detail
+
+
+def lock_hash():
+    import hashlib
+    return hashlib.sha256(UV_LOCK.encode()).hexdigest()
 
 
 class BootstrapRegression(unittest.TestCase):
@@ -211,6 +253,66 @@ class BootstrapRegression(unittest.TestCase):
         self.assertIn("installer-ran", trace)
         self.assertIn("brew install uv", trace)
         self.assertIn("app-started", trace)
+
+
+class DependencySyncRegression(unittest.TestCase):
+    """已存在的 venv 不会因为随包 uv.lock 变了就补依赖，这里钉住那套戳逻辑。
+
+    真实事故：zstandard 加进 pyproject 后，老 venv 静默缺包，数据库直读只会少消息
+    （压缩行解不开就跳过），界面上看不出任何异常。
+    """
+
+    def test_changed_lock_resyncs_without_rebuilding_the_venv(self):
+        def prepare(root):
+            stamp = root / "home/Library/Application Support/jev-jarvis/uv.lock.sha256"
+            write(stamp, "打错的旧戳\n")
+        completed, trace, log, stamp = run_fixture("existing-venv", prepare=prepare)
+        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertIn("uv sync", trace)
+        self.assertNotIn("rm -rf", log)          # 原地同步，不重建（不必重下 torch）
+        self.assertIn("app-started", trace)
+        self.assertEqual(stamp, lock_hash())
+
+    def test_unchanged_lock_skips_the_sync(self):
+        def prepare(root):
+            stamp = root / "home/Library/Application Support/jev-jarvis/uv.lock.sha256"
+            write(stamp, lock_hash() + "\n")
+        completed, trace, log, _stamp = run_fixture("existing-venv", prepare=prepare)
+        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertNotIn("uv sync", trace)
+        self.assertIn("app-started", trace)
+
+    def test_missing_stamp_syncs_once_then_records_it(self):
+        # 升级上来的老用户没有戳：同步一次（依赖齐全时 uv 是快操作），并把戳补上
+        completed, trace, log, stamp = run_fixture("existing-venv")
+        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertIn("uv sync", trace)
+        self.assertEqual(stamp, lock_hash())
+
+
+class ConfigPathRegression(unittest.TestCase):
+    """配置目录必须和设置窗口写的那份一致（XDG 优先），否则界面里改了不生效。"""
+
+    def test_default_config_is_dot_config(self):
+        def prepare(root):
+            write(root / "home/.config/jev-jarvis/env", "export JEV_SOURCE=db\n")
+        completed, trace, log, _stamp = run_fixture("existing", prepare=prepare)
+        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertIn("source=db", trace)
+
+    def test_xdg_config_wins_over_dot_config(self):
+        def prepare(root):
+            write(root / "home/.config/jev-jarvis/env", "export JEV_SOURCE=ocr\n")
+            write(root / "xdg/jev-jarvis/env", "export JEV_SOURCE=db\n")
+        completed, trace, log, _stamp = run_fixture(
+            "existing", prepare=prepare, env_extra={"XDG_CONFIG_HOME": "xdg"})
+        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertIn("source=db", trace)
+
+    def test_no_config_file_still_starts(self):
+        completed, trace, log, _stamp = run_fixture("existing")
+        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertIn("source=unset", trace)
 
 
 if __name__ == "__main__":

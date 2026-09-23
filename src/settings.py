@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -9,9 +11,14 @@ import AppKit as A
 import objc
 from Foundation import NSObject, NSMakeRect
 
-import builtin
-import userconfig
-import settings_config as config
+sys_path = str(Path(__file__).parent)
+if sys_path not in sys.path:
+    sys.path.insert(0, sys_path)
+
+import builtin  # noqa: E402
+import userconfig  # noqa: E402
+import settings_config as config  # noqa: E402
+import wechat_keys  # noqa: E402
 
 
 class SettingsController(NSObject):
@@ -87,16 +94,27 @@ class SettingsController(NSObject):
                 self.initial[f"{prefix}_{name}"] = value
                 self.controls.append(field)
             self.fields[prefix] = fields
+            # 「获取模型列表」lists whatever /models returns, thinking models included, and
+            # a thinking model produces zero candidates here (generate.THINKING_ONLY_HINT).
+            # 测试连接 already catches it, but nothing stops a user from picking one from the
+            # dropdown and saving without testing — which is exactly how it gets hit. The
+            # judgment tab is exempt: it has no reply-length cap to fill up.
+            if prefix != "TYPESAFE":
+                warn = self.label(panel, "⚠️ 生成层别用思考模型：思考占满输出长度，候选为 0"
+                                  + ("；DeepSeek 用 deepseek-chat" if prefix == "OPENAI" else ""),
+                                  14, 65, 666, 19, 12)
+                warn.setTextColor_(A.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.55, 0.25, 0.02, 1))
             hint = ("Jev 地址不含 /v1；列表接口不可用时，可手填模型。" if prefix == "TYPESAFE"
                     else "可手填模型。Ollama 地址通常含 /v1，密钥可填 ollama。" if prefix == "OPENAI"
                     else "使用 Anthropic 消息接口，支持自定义兼容服务地址。")
-            self.label(panel, hint, 14, 46, 666, 24, 12)
+            self.label(panel, hint, 14, 46, 666, 19, 12)
             for text, action, x in (("获取模型列表", "fetchModels:", 370), ("测试连接", "testConnection:", 532)):
                 button = self.button(panel, text, action, x, 4, 150)
                 button.setTag_(index)
                 self.controls.append(button)
             item.setView_(panel)
             self.tabs.addTabViewItem_(item)
+        self._build_source_tab(values)
         view.addSubview_(self.tabs)
         self.label(view, "优先级：环境变量 > 用户 env > 项目 .env > 内置；两组生成密钥同时存在时 OpenAI 优先。\n清空此文件的密钥不屏蔽其他来源；切换服务需清除原来源中的优先密钥。", 24, 82, 710, 44, 12)
         self.status = self.label(view, "测试会发送固定问候语，不读取微信内容；可能产生少量服务费用。", 24, 36, 535, 42, 12)
@@ -157,6 +175,90 @@ class SettingsController(NSObject):
         return summary, detail
 
     @objc.python_method
+    def _build_source_tab(self, values):
+        """数据源标签页：OCR 读屏（默认）还是数据库直读，以及后者的前提条件。
+
+        单独一个标签页而不是塞进模型页：它决定的是「消息从哪来」，和模型凭据无关；
+        而且切到 db 需要额外的密钥提取（要 sudo 和一次微信重新登录），必须写在
+        用户能看见的地方，而不是等启动日志里回退。
+        """
+        item = A.NSTabViewItem.alloc().initWithIdentifier_("SOURCE")
+        item.setLabel_("感知 · 数据源")
+        panel = A.NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 690, 300))
+
+        # 选中态来自配置文件；文件没写就是默认数据源（db）。顶部那行「本次启动」说
+        # 的是正在跑的那个（可能来自环境变量或 --source），两者不同是正常的。
+        current = config.validate_source(values.get("JEV_SOURCE")
+                                         or userconfig.DEFAULT_PERCEPTION_SOURCE)
+        running = userconfig.perception_source()
+        self.source_seg = A.NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(14, 252, 360, 28))
+        self.source_seg.setSegmentCount_(2)
+        for i, label in enumerate(("OCR 读屏", "数据库直读（默认）")):
+            self.source_seg.setLabel_forSegment_(label, i)
+        self.source_seg.setSelectedSegment_(1 if current == "db" else 0)
+        self.source_seg.setTarget_(self)
+        self.source_seg.setAction_("sourceChanged:")
+        self.source_seg.setAccessibilityLabel_("数据源")
+        panel.addSubview_(self.source_seg)
+        self.controls.append(self.source_seg)
+
+        if running == "db":
+            summary = "本次启动：数据库直读（消息来自微信本地库，不读屏）"
+        else:
+            summary = "本次启动：OCR 读屏（截取微信窗口 + Vision 识别）"
+        badge = self.label(panel, summary, 14, 224, 666, 24, 14)
+        badge.setFont_(A.NSFont.boldSystemFontOfSize_(14))
+        badge.setTextColor_(A.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.10, 0.32, 0.70, 1))
+        self.label(panel, "数据库直读（默认）：只读打开微信自己的加密库，消息更全（带真实上文、不漏屏外消息），"
+                          "没有密钥时会自动退回读屏。\n"
+                          "需要先提取密钥——要 sudo 给微信 ad-hoc 重签名（去掉 Hardened Runtime），"
+                          "首次还要在微信里退出登录再登录一次。\n"
+                          "OCR 读屏：不需要额外权限，不接触微信数据文件。\n"
+                          "两条路径都不注入、不 hook、不自动发送消息；填入仍是唯一的写动作。",
+                   14, 138, 666, 82, 12)
+
+        self.label(panel, "密钥文件（留空用默认位置）", 14, 118, 200, 22, 12)
+        self.keys_field = A.NSTextField.alloc().initWithFrame_(NSMakeRect(220, 116, 458, 26))
+        self.keys_field.setStringValue_(values.get("JEV_KEYS_FILE", ""))
+        self.keys_field.setPlaceholderString_(str(wechat_keys.keys_file()))
+        self.keys_field.setFont_(A.NSFont.systemFontOfSize_(13))
+        self.keys_field.setDelegate_(self)
+        self.keys_field.setAccessibilityLabel_("微信密钥文件")
+        panel.addSubview_(self.keys_field)
+        self.controls.append(self.keys_field)
+
+        self.key_status = self.label(panel, wechat_keys.status_line(), 14, 82, 666, 24, 12)
+        self.key_status.setTextColor_(A.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.0 if wechat_keys.has_keys() else 0.55, 0.35 if wechat_keys.has_keys() else 0.25, 0.10, 1))
+        button = self.button(panel, "在终端里提取密钥…", "extractKeys:", 14, 34, 210)
+        self.controls.append(button)
+        self.label(panel, "会在终端里先重签名微信、再提取密钥；密钥与解密快照都写到仓库之外。",
+                   234, 38, 444, 34, 12)
+
+        item.setView_(panel)
+        self.tabs.addTabViewItem_(item)
+        self.source_initial = {"JEV_SOURCE": current,
+                               "JEV_KEYS_FILE": values.get("JEV_KEYS_FILE", "")}
+
+    @objc.python_method
+    def source_values(self):
+        return {"JEV_SOURCE": "db" if self.source_seg.selectedSegment() == 1 else "ocr",
+                "JEV_KEYS_FILE": str(self.keys_field.stringValue()).strip()}
+
+    def sourceChanged_(self, sender):
+        self.set_status("数据源已修改，保存后重启生效。")
+
+    def extractKeys_(self, sender):
+        """在终端里跑提取脚本：它需要 sudo 交互，不适合塞进本进程。"""
+        try:
+            subprocess.Popen(["open", "-a", "Terminal", str(wechat_keys.EXTRACT_COMMAND)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.set_status(f"打不开终端，请手动运行：{wechat_keys.EXTRACT_COMMAND}", "error")
+            return
+        self.set_status("已在终端打开提取脚本；完成后回到这里点保存，并重启应用。")
+
+    @objc.python_method
     def label(self, view, text, x, y, w, h, size=13):
         field = A.NSTextField.wrappingLabelWithString_(text)
         field.setFrame_(NSMakeRect(x, y, w, h))
@@ -185,8 +287,11 @@ class SettingsController(NSObject):
 
     @objc.python_method
     def changed(self):
-        return {f"{p}_{k}": v for p in config.PREFIXES for k, v in self.values(p).items()
-                if v != self.initial[f"{p}_{k}"]}
+        changed = {f"{p}_{k}": v for p in config.PREFIXES for k, v in self.values(p).items()
+                   if v != self.initial[f"{p}_{k}"]}
+        changed.update({k: v for k, v in self.source_values().items()
+                        if v != self.source_initial.get(k)})
+        return changed
 
     def controlTextDidChange_(self, notification):
         field = notification.object()
@@ -225,6 +330,9 @@ class SettingsController(NSObject):
             return
         self.initial.update(changes)
         self.file_values.update(changes)
+        self.source_initial.update({k: v for k, v in changes.items()
+                                    if k in config.EXTRA_KEYS})
+        self.key_status.setStringValue_(wechat_keys.status_line())
         self.set_status("已保存。请退出并重新打开应用；当前会话继续使用启动时的配置。", "success")
 
     def fetchModels_(self, sender):

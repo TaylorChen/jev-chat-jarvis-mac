@@ -172,5 +172,223 @@ class SettingsNetwork(unittest.TestCase):
         self.assertEqual(len(Server.requests), 4)
 
 
+class PerceptionSource(unittest.TestCase):
+    """数据源可配置：默认 db（数据库直读），没有密钥时回退 OCR，命令行能临时覆盖。"""
+
+    def _with_env(self, values):
+        return patch.dict(os.environ, values, clear=True), \
+            patch.object(userconfig, '_startup_sources', None), \
+            patch.object(userconfig, 'env_files', return_value=[]), \
+            patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env'))
+
+    def test_default_is_db(self):
+        a, b, c, d = self._with_env({})
+        with a, b, c, d:
+            self.assertEqual(userconfig.perception_source(), 'db')
+            self.assertEqual(userconfig.DEFAULT_PERCEPTION_SOURCE, 'db')
+
+    def test_env_can_select_ocr(self):
+        a, b, c, d = self._with_env({'JEV_SOURCE': 'ocr'})
+        with a, b, c, d:
+            self.assertEqual(userconfig.perception_source(), 'ocr')
+
+    def test_legacy_switch_still_works(self):
+        # 旧写法 JEV_DB_MODE=1 必须继续认，否则老用户的配置会静默失效
+        a, b, c, d = self._with_env({'JEV_DB_MODE': '1'})
+        with a, b, c, d:
+            self.assertEqual(userconfig.perception_source(), 'db')
+
+    def test_source_wins_over_legacy_switch(self):
+        a, b, c, d = self._with_env({'JEV_SOURCE': 'ocr', 'JEV_DB_MODE': '1'})
+        with a, b, c, d:
+            self.assertEqual(userconfig.perception_source(), 'ocr')
+
+    def test_cli_overrides_everything(self):
+        a, b, c, d = self._with_env({'JEV_SOURCE': 'db'})
+        with a, b, c, d:
+            self.assertEqual(userconfig.perception_source('ocr'), 'ocr')
+            self.assertEqual(userconfig.perception_source('DB'), 'db')
+
+    def test_unknown_value_is_passed_through_for_the_caller_to_reject(self):
+        # 解析层不静默纠正：hud 会打出「不认识，按 ocr 启动」，让用户看见自己写错了
+        a, b, c, d = self._with_env({'JEV_SOURCE': 'screen'})
+        with a, b, c, d:
+            self.assertEqual(userconfig.perception_source(), 'screen')
+            self.assertNotIn('screen', userconfig.PERCEPTION_SOURCES)
+
+    def test_source_arg_forms(self):
+        self.assertEqual(userconfig.source_arg(['--source', 'db']), 'db')
+        self.assertEqual(userconfig.source_arg(['--source=ocr']), 'ocr')
+        self.assertIsNone(userconfig.source_arg(['--boxes']))
+        self.assertEqual(userconfig.source_arg(['--source']), '')
+
+    def test_settings_write_accepts_source_and_keys_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'env'
+            original = '# keep\nOPENAI_MODEL=old\n'
+            path.write_text(original)
+            config.write_settings(path, original, {'JEV_SOURCE': 'db',
+                                                   'JEV_KEYS_FILE': '~/keys.json'})
+            values = userconfig.parse_env_file(path)
+            self.assertEqual(values['JEV_SOURCE'], 'db')
+            self.assertEqual(values['JEV_KEYS_FILE'], '~/keys.json')
+            self.assertIn('# keep\n', path.read_text())
+            self.assertEqual(values['OPENAI_MODEL'], 'old')
+
+    def test_settings_write_normalises_and_rejects_bad_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'env'
+            text = config.write_settings(path, '', {'JEV_SOURCE': ' DB '})
+            self.assertEqual(userconfig.parse_env_file(path)['JEV_SOURCE'], 'db')
+            with self.assertRaises(ValueError):
+                config.write_settings(path, text, {'JEV_SOURCE': 'screen'})
+            with self.assertRaises(ValueError):
+                config.write_settings(path, text, {'UNRELATED_KEY': 'x'})
+
+
+class WechatKeys(unittest.TestCase):
+    """密钥文件定位：显式配置 > 应用数据目录 > 旧手工布局，且不泄漏密钥内容。"""
+
+    def test_default_is_the_app_data_dir(self):
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d, \
+                patch.dict(os.environ, {}, clear=True), \
+                patch.object(userconfig, '_startup_sources', None), \
+                patch.object(userconfig, 'env_files', return_value=[]), \
+                patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')), \
+                patch.object(wechat_keys, 'KEYS_FILE', Path(d) / 'wechat_keys.json'), \
+                patch.object(wechat_keys, 'LEGACY_KEYS_FILE', Path(d) / 'legacy.json'):
+            self.assertEqual(wechat_keys.keys_file(), Path(d) / 'wechat_keys.json')
+
+    def test_legacy_layout_is_still_read(self):
+        # 早期手工 clone 到 ~/python 的用户不该因为升级就「密钥消失」
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d, \
+                patch.dict(os.environ, {}, clear=True), \
+                patch.object(userconfig, '_startup_sources', None), \
+                patch.object(userconfig, 'env_files', return_value=[]), \
+                patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')), \
+                patch.object(wechat_keys, 'KEYS_FILE', Path(d) / 'wechat_keys.json'), \
+                patch.object(wechat_keys, 'LEGACY_KEYS_FILE', Path(d) / 'legacy.json'):
+            (Path(d) / 'legacy.json').write_text('{}')
+            self.assertEqual(wechat_keys.keys_file(), Path(d) / 'legacy.json')
+
+    def test_explicit_configuration_wins(self):
+        with patch.dict(os.environ, {'JEV_KEYS_FILE': '/tmp/jev-test-keys.json'}, clear=True), \
+                patch.object(userconfig, '_startup_sources', None), \
+                patch.object(userconfig, 'env_files', return_value=[]), \
+                patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')):
+            import wechat_keys
+            self.assertEqual(str(wechat_keys.keys_file()), '/tmp/jev-test-keys.json')
+            self.assertTrue(wechat_keys.extraction_command().endswith('--decrypt'))
+
+    def test_key_count_tolerates_missing_and_broken_files(self):
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'keys.json'
+            self.assertEqual(wechat_keys.key_count(path), 0)
+            path.write_text('not json')
+            self.assertEqual(wechat_keys.key_count(path), 0)
+            path.write_text(json.dumps({'message/message_0.db': {'enc_key': 'aa'},
+                                        'message/message_1.db': {'salt': 'bb'},
+                                        'junk': 3}))
+            self.assertEqual(wechat_keys.key_count(path), 1)
+
+    def test_status_line_never_contains_key_material(self):
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'keys.json'
+            path.write_text(json.dumps({'message/message_0.db': {'enc_key': 'deadbeef'}}))
+            with patch.object(wechat_keys, 'keys_file', return_value=path):
+                line = wechat_keys.status_line()
+            self.assertIn('1 个库', line)
+            self.assertNotIn('deadbeef', line)
+
+    def test_resolve_source_falls_back_with_a_reason(self):
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d, \
+                patch.dict(os.environ, {}, clear=True), \
+                patch.object(userconfig, '_startup_sources', None), \
+                patch.object(userconfig, 'env_files', return_value=[]), \
+                patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')), \
+                patch.object(wechat_keys, 'keys_file', return_value=Path(d) / '无密钥.json'):
+            # 默认就是 db：没密钥时必须回退并说明原因，而不是让应用起不来
+            source, note = wechat_keys.resolve_source()
+            self.assertEqual(source, 'ocr')
+            self.assertIn('密钥', note)
+            self.assertEqual(wechat_keys.resolve_source('db')[0], 'ocr')
+            self.assertIn('密钥', wechat_keys.resolve_source('db')[1])
+            self.assertEqual(wechat_keys.resolve_source('ocr'), ('ocr', ''))
+            self.assertEqual(wechat_keys.resolve_source('screen'),
+                             ('ocr', "数据源 'screen' 不认识（只支持 ocr / db），已按 ocr 启动"))
+
+    def test_missing_sqlcipher_falls_back_to_ocr_with_the_install_hint(self):
+        # 提取密钥不需要 sqlcipher，用户很容易漏装；缺它时 db 每跳都会子进程报错，
+        # 不如直接退回读屏并把安装命令写清楚
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d:
+            keys = Path(d) / 'wechat_keys.json'
+            keys.write_text(json.dumps({'message/message_0.db': {'enc_key': 'aa'}}))
+            with patch.object(wechat_keys, 'KEYS_FILE', keys), \
+                    patch.object(wechat_keys, 'LEGACY_KEYS_FILE', Path(d) / 'none.json'), \
+                    patch.object(wechat_keys, 'sqlcipher_path', return_value=None), \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch.object(userconfig, '_startup_sources', None), \
+                    patch.object(userconfig, 'env_files', return_value=[]), \
+                    patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')):
+                source, note = wechat_keys.resolve_source('db')
+                self.assertEqual(source, 'ocr')
+                self.assertIn('sqlcipher', note)
+                self.assertIn('brew install sqlcipher', wechat_keys.status_line())
+
+    def test_status_line_is_quiet_when_sqlcipher_is_present(self):
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d:
+            keys = Path(d) / 'wechat_keys.json'
+            keys.write_text(json.dumps({'message/message_0.db': {'enc_key': 'aa'}}))
+            with patch.object(wechat_keys, 'KEYS_FILE', keys), \
+                    patch.object(wechat_keys, 'sqlcipher_path', return_value='/usr/local/bin/sqlcipher'):
+                self.assertNotIn('sqlcipher', wechat_keys.status_line())
+
+    def test_lldb_is_optional_not_fatal(self):
+        # 上游是四级路径：只有「首次抓 passphrase」（微信 4.1.10+）才需要 lldb
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d:
+            keys = Path(d) / 'wechat_keys.json'
+            keys.write_text(json.dumps({'message/message_0.db': {'enc_key': 'aa'}}))
+            with patch.object(wechat_keys, 'KEYS_FILE', keys), \
+                    patch.object(wechat_keys, 'sqlcipher_path', return_value='/usr/local/bin/sqlcipher'), \
+                    patch.object(wechat_keys, 'lldb_path', return_value=None), \
+                    patch.object(wechat_keys, 'passphrase_cached', return_value=True):
+                # 有密钥 → 状态行照旧，不因为缺 lldb 报警
+                self.assertNotIn('lldb', wechat_keys.status_line())
+            with patch.object(wechat_keys, 'KEYS_FILE', Path(d) / 'none.json'), \
+                    patch.object(wechat_keys, 'LEGACY_KEYS_FILE', Path(d) / 'none2.json'), \
+                    patch.object(wechat_keys, 'lldb_path', return_value=None), \
+                    patch.object(wechat_keys, 'passphrase_cached', return_value=False):
+                # 没密钥 + 没 passphrase 缓存 + 没 lldb → 提前说清首次提取需要什么
+                self.assertIn('xcode-select --install', wechat_keys.status_line())
+            with patch.object(wechat_keys, 'KEYS_FILE', Path(d) / 'none.json'), \
+                    patch.object(wechat_keys, 'LEGACY_KEYS_FILE', Path(d) / 'none2.json'), \
+                    patch.object(wechat_keys, 'lldb_path', return_value=None), \
+                    patch.object(wechat_keys, 'passphrase_cached', return_value=True):
+                # passphrase 已缓存：重新提取不必再走 lldb，状态行不该提它
+                self.assertNotIn('lldb', wechat_keys.status_line())
+
+    def test_resolve_source_accepts_db_once_keys_exist(self):
+        import wechat_keys
+        with tempfile.TemporaryDirectory() as d:
+            keys = Path(d) / 'wechat_keys.json'
+            keys.write_text(json.dumps({'message/message_0.db': {'enc_key': 'aa'}}))
+            with patch.object(wechat_keys, 'KEYS_FILE', keys), \
+                    patch.object(wechat_keys, 'LEGACY_KEYS_FILE', Path(d) / 'none.json'), \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch.object(userconfig, '_startup_sources', None), \
+                    patch.object(userconfig, 'env_files', return_value=[]), \
+                    patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')):
+                self.assertEqual(wechat_keys.resolve_source('db'), ('db', ''))
+                self.assertEqual(wechat_keys.resolve_source(), ('db', ''))   # 默认也是 db
+
+
 if __name__ == '__main__':
     unittest.main()

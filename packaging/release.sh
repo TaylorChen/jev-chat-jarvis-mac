@@ -98,6 +98,8 @@ check "bootstrap 带可执行权限"        "[ -x '$TMP/jev-jarvis.app/Contents/
 check "Info.plist 合法"             "plutil -lint '$TMP/jev-jarvis.app/Contents/Info.plist'"
 check "图标在"                      "[ -f '$TMP/jev-jarvis.app/Contents/Resources/AppIcon.icns' ]"
 check "包内 Python 版本已钉住"        "[ -f '$TMP/jev-jarvis.app/Contents/Resources/app/.python-version' ]"
+check "包内带密钥提取工具（数据源 db）"  "[ -f '$TMP/jev-jarvis.app/Contents/Resources/app/tools/wcdb_key_tool/wcdb_key_tool_macos.py' ]"
+check "第三方许可随包"                "[ -f '$TMP/jev-jarvis.app/Contents/Resources/app/tools/wcdb_key_tool/LICENSE' ]"
 
 echo "==> 完成"
 du -sh "$ZIP" | awk '{print "    zip 体积: " $1}'
@@ -117,7 +119,7 @@ if [ "$PUBLISH" = 1 ]; then
         echo "需要 **macOS 13+**。下载即用：解压后把 \`jev-jarvis.app\` 拖进「应用程序」。"
         echo
         echo "**第一次打开**：右键（或按住 Control 点）→ 打开 → 再点「打开」。未做 Apple 公证，双击会被 Gatekeeper 拦，只需这一次。"
-        echo "**第一次启动**：联网装依赖（uv 缓存命中就很快）；只需给 \`jev-jarvis\` 授予「屏幕录制」权限，然后退出重开，无需单独授权 \`python3.12\`。"
+        echo "**第一次启动**：联网装依赖（uv 缓存命中就很快）；默认按数据库直读跑——还没提取密钥时会自动退回 OCR 读屏，此时只要给 \`jev-jarvis\` 授予「屏幕录制」权限再退出重开即可，无需单独授权 \`python3.12\`。想用数据库直读跑 \`./tools/extract_wechat_keys.command\`。"
         echo "**判断层默认跑本地模型，首次要下载约 7GB**（之后离线可用）。不想下这么大：在 \`~/.config/jev-jarvis/env\` 里给判断层配一个 key 走云端，见 README「配置」。"
         echo
         echo "### 本次包含"

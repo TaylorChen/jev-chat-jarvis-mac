@@ -134,11 +134,15 @@ class ThinkingOnlyError(Exception):
     """
 
 
-# The message carried by ThinkingOnlyError. Fits the panel's err[:60] display budget for
-# realistic model names (fixed part is 41 chars), so the suggestion survives truncation.
+# The message carried by ThinkingOnlyError. Never call this budget 「额度」: that word reads
+# as account balance, so a wrong-model problem was reported as "my DeepSeek credit ran out"
+# — the one misreading this message exists to prevent. It is the reply-length cap.
+# Fits the panel's err[:60] display budget: the fixed part is 22 chars, so {alt} still
+# survives truncation for a 15-char model name (the previous 41-char text did not — it was
+# cut at 「换非思考模」 for deepseek-v4-pro, losing the whole suggestion).
 # {alt} is a non-thinking model the configured endpoint actually serves (see _call).
-THINKING_ONLY_HINT = ("思考型 {model}：额度被思考耗尽，正文 0 条；"
-                      "换非思考模型（如 {alt}）")
+THINKING_ONLY_HINT = ("{model} 是思考型：思考占满输出长度，没写正文；"
+                      "换 {alt}")
 
 # One request per tone. {n} appears twice on purpose: the "exactly n lines" demand has to
 # agree with the count asked for, or the model pads the answer with a line of its own.
