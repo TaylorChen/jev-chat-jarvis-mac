@@ -31,6 +31,47 @@
 | 前置条件 | 运行一次 `tools/extract_wechat_keys.command` | 无 |
 | 已知取舍 | 大库（几百 MB WAL 的公众号库）单次读取约几秒；窗口不在屏幕上时填不入 | 屏外消息看不到、微信改版会让布局常量失效 |
 
+### 工作原理：数据库直读是怎么读到消息的
+
+**库布局**（`~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<wxid>_<hash>/db_storage/`）：
+
+| 库 | 内容 |
+|---|---|
+| `message/message_0/1/2.db` | 个人与群聊消息，**按时间分片**（旧→新分布在 0→2），同一会话跨库 |
+| `message/biz_message_0/1/2.db` | 公众号消息（同样分片） |
+| `session/session.db` | 会话列表（SessionTable：最后活跃时间、摘要、清未读时间戳） |
+| `contact/contact.db` | 联系人（备注/昵称，用于显示名解析） |
+| `message/message_resource.db` | 消息资源索引（图片/视频的尺寸与状态） |
+| `msg/attach/<hash>/<YYYY-MM>/Img/*.dat` | 图片缩略图与原图（**未加密 JPEG**，旧式 `_t_M.dat`；新式 `_t.dat` 为 V2 加密，暂不可解） |
+
+**加密与打开**：每库是 SQLCipher 4（页 4096、HMAC-SHA512、PBKDF2-SHA512）。每个库有**各自的 32 字节 raw key**（互不相同），由一次抓取的 passphrase 对每库 salt 做 `PBKDF2-HMAC-SHA512(passphrase, salt, 256000)` 派生。读取 = `sqlcipher -readonly` 直接打开 live 库 + `PRAGMA key = "x'<raw_key>'"`——**零拷贝、绝不写微信文件**，已合并进主库的数据实时可读；仍在 `.material` 增量中的极新数据要等微信合并完成（通常几秒～几分钟），期间读取自动重试。
+
+**消息表命名**：`Msg_<md5(username)>`，即会话 username 的 md5。一条图片消息的典型行：
+
+```sql
+CREATE TABLE Msg_48d3e17789e8816e9b1b6079fe641632(
+    local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id INTEGER,
+    local_type INTEGER,          -- 1=文本 3=图片 34=语音 43=视频 47=表情 49=链接卡片 10000=系统
+    sort_seq INTEGER,            -- 会话内排序键
+    real_sender_id INTEGER,      -- → 本库 Name2Id 表的 rowid（发送者，每库独立）
+    create_time INTEGER,         -- Unix 秒
+    message_content TEXT,        -- 文本/（群消息自带「昵称:\n」前缀）/ XML
+    WCDB_CT_message_content ..., -- 压缩标记：=4 时 message_content 是 zstd 帧（hex 传输，Python 侧解压）
+    ...);
+```
+
+**四个关键细节**（都是实测踩出来的）：
+
+1. **按会话分表 + 按时间分库**：同一会话的消息散布在 message_0/1/2 多个库里（旧分片→新分片），必须跨库合并按 create_time 排序去重，只读一个库会拿到「时间碎片」
+2. **发送者解析每库独立**：消息行的 `real_sender_id` 是该库 `Name2Id` 表的 rowid（user_name → id 的映射**每个库各自独立**，不能跨库复用）；群消息正文自带 `昵称:` 前缀
+3. **内容压缩**：`WCDB_CT_message_content = 4` 的行是 zstd 压缩帧（读出时以 hex 传输，Python 侧解压）；`= 0` 为明文
+4. **合并窗口**：微信周期性把 `.material` 增量合并回主库，期间拷贝/打开会间歇失败（file is not a database）——读取代码自动重试穿过
+
+**图片在哪**：`msg/attach/<md5(username)>/<YYYY-MM>/Img/` 下 `_t_M.dat`（缩略图）与 `_M.dat`（原图）是**未加密 JPEG**，按文件 mtime 就近匹配消息时间即可显示；新版 `_t.dat` 是 V2 加密格式（暂无法解出，对应消息显示 `[图片]` 占位）。
+
+**触发语义**：默认 `follow` 模式只处理你最近打开过的会话（清未读时间最新者）的新到达对方文本消息；`JEV_DB_WATCH=all` 则所有会话的新消息都触发。
+
 面板上随时能核对这次分析用了什么：**标题栏**写着数据源与条数（`数据库直读 N 条` / `OCR 读屏`），消息下面两行分别是**这段上下文的起止时间**（`历史 09-23 14:56 → 17:25 · 100 条`）和**JEV 的触发情况**（`JEV 已触发 17:20:31 · 停稳 1.2s 后上屏` / `JEV 判定完成 17:20:32 · 603ms` / `等待对方消息 · 到达即触发 JEV 预判`）。面板右上角**列表图标**或**「跟随哪个会话」有个诚实的前提**：微信只在**清未读**时记录时间戳。你点开一个**没有未读**的会话时，微信不写任何东西（实测：点开后该会话的时间戳原地不动），AX 也读不到会话列表（微信只暴露窗口按钮）——所以「自动跟随」只在你点开的会话有未读消息时成立。要一直盯住某个会话，点面板右上角的**图钉图标**（或菜单栏 **J →「跟随会话 ▸」**）从最近活跃会话里选一个（带未读数）——钉住后面板标题标 **· 手动**，选「自动」随时恢复；钉住期间只读你指定的那个会话。
 
 菜单栏 **J →「查看读到的消息…」** 会把这一跳实际读到的消息原样列出来（会话名、时间、我/对方、正文，默认 100 条），打开时**默认停在最新一条**（不用手动往下滑），窗口开着时每读完一跳自动刷新——判断到底喂了什么上下文，看这个窗口就够了；日志里对应那行也会写「读到 N 条 · 上下文 M 条」。上下文条数可用 `JEV_CONTEXT_MESSAGES` 调（不填 = 数据库直读用全部读到）。
