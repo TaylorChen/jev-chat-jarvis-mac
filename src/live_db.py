@@ -151,7 +151,12 @@ class LiveProvider:
         self.live_dir = Path(live_dir) if live_dir else find_live_dir()
         if not self.live_dir:
             raise RuntimeError("未找到 live db_storage，请确认微信 4.x 已登录过")
-        keys_file = Path(keys_file) if keys_file else DEFAULT_KEYS
+        try:
+            import wechat_keys as _wk
+            keys_file = _wk.keys_file()
+        except ImportError:
+            keys_file = (Path.home() / "Library/Application Support/"
+                         "jev-jarvis/wechat_keys.json")
         raw = json.loads(keys_file.read_text()) if keys_file.exists() else {}
         self.keys = {k: v for k, v in raw.items() if isinstance(v, dict)}
         self.self_wxid = self_wxid or self._detect_self_wxid()
