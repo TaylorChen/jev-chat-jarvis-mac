@@ -162,6 +162,7 @@ class LiveProvider:
         self.self_wxid = self_wxid or self._detect_self_wxid()
         self._contact = {}
         self._db_tables = {}     # rel -> (集合, 时间戳)；空集合 + 时间戳 = 60s 内不重扫
+        self._thumb_cache = {}   # (username, 分钟桶) -> [(mtime, path)]
         self._self_ids = {}      # db_filename -> self rowid
         self._load_contact()
         # 启动自检：认不出「自己」时每一条消息都会被当成对方（连自己的话一起分析），
@@ -287,6 +288,48 @@ class LiveProvider:
             self._tables_of(stale[0])
         return [(rel, table) for rel in rels if table in self._tables_of(rel)]
 
+    def _thumb_index(self, username: str | None = None) -> list[tuple[float, Path]]:
+        """attach 树的缩略图索引 [(mtime, path)]（120s 缓存；username 参数兼容旧调用）。
+
+        微信 4.x：attach/<hash>/<YYYY-MM>/Img/<md5>_t_M.dat 为**未加密 JPEG**
+        （hash 目录与会话的对应关系随版本变化，故直接全树扫描、按 mtime 匹配）；
+        新版 _t.dat 为 V2 加密格式暂无法解出（对应消息显示占位符）。
+        """
+        cache_key = int(time.time() // 120)
+        cached = self._thumb_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        for k in [k for k in self._thumb_cache if k != cache_key]:
+            self._thumb_cache.pop(k, None)
+        attach = self.live_dir.parent / "msg" / "attach"
+        out: list[tuple[float, Path]] = []
+        if attach.exists():
+            for pth in attach.rglob("*_t_M.dat"):
+                try:
+                    out.append((pth.stat().st_mtime, pth))
+                except OSError:
+                    pass
+            out.sort()
+        self._thumb_cache[cache_key] = out
+        return out
+
+    def _thumb_for(self, username: str, ts: float) -> Path | None:
+        """找 mtime 最接近消息时间的缩略图（±10 分钟）。"""
+        idx = self._thumb_index(username)
+        if not idx:
+            return None
+        best = min(idx, key=lambda e: abs(e[0] - ts))
+        return best[1] if abs(best[0] - ts) <= 600 else None
+
+
+    def _thumb_for(self, username: str, ts: float) -> Path | None:
+        """找 mtime 最接近消息时间的缩略图（±8 分钟）。"""
+        idx = self._thumb_index()
+        if not idx:
+            return None
+        best = min(idx, key=lambda e: abs(e[0] - ts))
+        return best[1] if abs(best[0] - ts) <= 480 else None
+
     def _self_id_of_rel(self, rel: str) -> int | None:
         """该库 Name2Id 里自己的 rowid（sender_id，每库独立）。
 
@@ -376,6 +419,9 @@ class LiveProvider:
                 body = body.strip()
                 if not body:
                     continue
+                img_path = None
+                if ltype == 3:
+                    img_path = self._thumb_for(username, int(r["create_time"] or 0))
                 if ltype != MSG_TEXT and ltype in NON_TEXT:
                     body = NON_TEXT[ltype]
                 key = (r["create_time"], sender, hash(body))
@@ -391,7 +437,7 @@ class LiveProvider:
                     # 没有前缀（单聊）或前缀就是原始 id：查 contact.db 要真名
                     name = self.display_name(display or username)
                 merged.append(dict(ts=int(r["create_time"] or 0), who=who,
-                                   name=name, text=body))
+                                   name=name, text=body, img_path=img_path))
         merged.sort(key=lambda m: m["ts"])
         return merged[-limit:]
 

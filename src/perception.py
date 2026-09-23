@@ -63,6 +63,7 @@ class Message:
     conf: float
     h: float = 0.0
     sender: str | None = None
+    img_path: str | None = None   # 数据库直读模式：图片消息的本地缩略图（明文 JPEG）
     lines: list[str] = field(default_factory=list)
     # normalized bounding box, kept spanning every folded line — the YOLO overlay draws
     # one box per message, so a 3-line message must cover all 3 lines, not its first

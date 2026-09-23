@@ -808,7 +808,8 @@ class HudController(NSObject):
     @objc.python_method
     def _message_rows(self):
         """这一跳读到的消息 → 查看窗口用的行（时间/方向/发送者/正文）。"""
-        return [(getattr(m, "ts", 0), m.side, m.sender, m.text)
+        return [(getattr(m, "ts", 0), m.side, m.sender, m.text,
+                 getattr(m, "img_path", None))
                 for m in (getattr(self, "_last_msgs", None) or [])]
 
     def openMessages_(self, sender):

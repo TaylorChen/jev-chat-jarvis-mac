@@ -475,7 +475,7 @@ class MessageRowsTests(unittest.TestCase):
                                 sender='张三', lines=[], ts=1700000000),
                         Message(text='好的', side='me', y=0.0, conf=1.0, lines=[], ts=0)]
         self.assertEqual(h._message_rows(),
-                         [(1700000000, 'them', '张三', '下午开会'), (0, 'me', None, '好的')])
+                         [(1700000000, 'them', '张三', '下午开会', None), (0, 'me', None, '好的', None)])
 
     def test_missing_last_read_is_empty_not_an_error(self):
         self.assertEqual(Harness()._message_rows(), [])

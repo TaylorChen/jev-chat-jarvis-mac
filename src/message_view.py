@@ -32,6 +32,41 @@ def _clock(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
 
+def attributed_rows(rows):
+    """rows: [(ts, who, sender, text[, img_path])] → 带内嵌图片的富文本。
+
+    图片行（img_path 非空）渲染为：文字行 + 换行 + 缩略图附件（宽 240pt 等比）。
+    """
+    import time as _time
+    font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(12, 0) \
+        if hasattr(AppKit.NSFont, "monospacedSystemFontOfSize_weight_") \
+        else AppKit.NSFont.systemFontOfSize_(12)
+    attrs = {AppKit.NSFontAttributeName: font,
+             AppKit.NSForegroundColorAttributeName: AppKit.NSColor.textColor}
+    out = AppKit.NSMutableAttributedString.alloc().init()
+    for row in rows:
+        ts, who, sender, text = row[0], row[1], row[2], row[3]
+        img_path = row[4] if len(row) > 4 else None
+        name = "我" if who == "me" else (sender or {"them": "对方"}.get(who, "方向未确认"))
+        body = text.replace("\n", " ⏎ ")
+        line = f"{_clock(int(ts or 0))}  {name}: {body}\n"
+        out.appendAttributedString_(
+            AppKit.NSAttributedString.alloc().initWithString_attributes_(line, attrs))
+        if img_path:
+            img = AppKit.NSImage.alloc().initWithContentsOfFile_(str(img_path))
+            if img is not None:
+                size = img.size()
+                if size.width > 220:
+                    img.setSize_(NSMakeSize(220, size.height * 220 / size.width))
+                cell = AppKit.NSTextAttachmentCell.imageCell_(img)
+                att = AppKit.NSTextAttachment.alloc().init()
+                att.setAttachmentCell_(cell)
+                out.appendAttributedString_(
+                    AppKit.NSAttributedString.alloc().initWithString_attributes_(
+                        "\uFFFC\n", attrs))
+    return out
+
+
 def format_rows(rows) -> str:
     """rows: [(ts, who, sender, text)] → 一行一条的纯文本（时间 说话人: 正文）。"""
     out = []
@@ -89,7 +124,7 @@ class MessageViewer(NSObject):
         self.text = AppKit.NSTextView.alloc().initWithFrame_(
             NSMakeRect(0, 0, WINDOW_W - 2 * PAD, WINDOW_H - 34 - 2 * PAD))
         self.text.setEditable_(False)
-        self.text.setRichText_(False)
+        self.text.setRichText_(True)   # 允许内嵌图片附件
         self.text.setFont_(AppKit.NSFont.fontWithName_size_("Menlo", 12)
                            or AppKit.NSFont.systemFontOfSize_(12))
         self.text.setAutoresizingMask_(AppKit.NSViewWidthSizable)
@@ -110,7 +145,7 @@ class MessageViewer(NSObject):
     def reload(self, title, rows, budget):
         """换一批内容重画（名字不叫 update：那会撞上 NSObject 的同名选择器）。"""
         self.summary.setStringValue_(format_summary(title, rows, budget))
-        self.text.setString_(format_rows(rows))
+        self.text.textStorage().setAttributedString_(attributed_rows(rows))
         self._scroll_to_newest()
         self._defer_scroll_to_newest()
 

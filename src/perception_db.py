@@ -220,4 +220,5 @@ def _to_hud_message(m: dict):
         sender=None if m["who"] == "我" else (m["name"] or None),
         lines=[m["text"]],
         ts=int(m.get("ts") or 0),
+        img_path=m.get("img_path"),
     )
