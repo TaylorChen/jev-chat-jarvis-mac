@@ -185,7 +185,7 @@ class LiveProvider:
 
     def _detect_self_wxid(self) -> str:
         import re
-        m = re.match(r"(.+)_\d{1,4}$", self.live_dir.parent.name)
+        m = re.match(r"(.+)_([0-9a-fA-F]{4}|\d{1,4})$", self.live_dir.parent.name)
         return m.group(1) if m else None
 
     def _probe_self_id(self, probes: int = 3) -> bool:
@@ -358,6 +358,8 @@ class LiveProvider:
         no such column，_query 吞掉），后果是**每条消息都被判成对方**。
         所以这里两种列名都试，命中即缓存；两个都失败不缓存（下一轮再试）。
         """
+        if not self.self_wxid:
+            return None
         if rel in self._self_ids:
             return self._self_ids[rel]
         for col in ("user_name", "username"):
@@ -433,13 +435,16 @@ class LiveProvider:
                 f"FROM {table} WHERE local_type IN (1,3,34,43,47,49) "
                 f"AND (create_time IS NULL OR create_time > {int(cutoff)}) "
                 f"ORDER BY sort_seq DESC LIMIT {int(limit)}")
+            if not rows:
+                continue
+            self_id = self._self_id_of_rel(rel)
             for r in rows:
                 content = _row_content(int(r["ct"] or 0), r["content"])
                 if not content:
                     continue
                 ltype = int(r["local_type"])
                 sender = int(r["real_sender_id"]) if r["real_sender_id"] is not None else None
-                mine = sender is not None and sender == self._self_id_of_rel(rel)
+                mine = sender is not None and sender == self_id
                 display, body = _strip_sender_prefix(content)
                 body = body.strip()
                 if not body:

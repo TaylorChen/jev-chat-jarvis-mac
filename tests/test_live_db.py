@@ -223,6 +223,13 @@ class SelfIdTests(unittest.TestCase):
         return FakeLive(self.tmp, {self.rel: {'enc_key': '00'}}, {self.rel: set()},
                         {self.rel: name2id})
 
+    def test_detect_self_wxid_with_hex_directory_suffix(self):
+        p = LiveProvider.__new__(LiveProvider)
+        p.live_dir = Path(self.tmp) / 'wxid_me_9d9a' / 'db_storage'
+        self.assertEqual(p._detect_self_wxid(), 'wxid_me')
+        p.live_dir = Path(self.tmp) / 'wxid_me_1234' / 'db_storage'
+        self.assertEqual(p._detect_self_wxid(), 'wxid_me')
+
     def test_user_name_column_is_queried_first(self):
         p = self._provider({'user_name': 16})
         self.assertEqual(p._self_id_of_rel(self.rel), 16)
@@ -239,6 +246,12 @@ class SelfIdTests(unittest.TestCase):
         self.assertIsNone(p._self_id_of_rel(self.rel))
         self.assertIsNone(p._self_id_of_rel(self.rel))
         self.assertEqual(p.count_queries('Name2Id'), 4)   # 两种列名 × 两次调用
+
+    def test_missing_self_wxid_does_not_query_name2id(self):
+        p = self._provider({})
+        p.self_wxid = None
+        self.assertIsNone(p._self_id_of_rel(self.rel))
+        self.assertEqual(p.count_queries('Name2Id'), 0)
 
     def test_startup_probe_ignores_media_databases_without_name2id(self):
         p = LiveProvider.__new__(LiveProvider)
@@ -322,11 +335,13 @@ class SenderNameTests(unittest.TestCase):
             self.self_wxid = 'me'
             self.live_dir = Path('/nonexistent')
             self.keys = {}
+            self.self_id_calls = []
 
         def _shards_for(self, username):
             return [('message/message_0.db', 'Msg_x')]
 
         def _self_id_of_rel(self, rel):
+            self.self_id_calls.append(rel)
             return 1                      # 自己
 
         def _query(self, rel, sql):
@@ -353,6 +368,13 @@ class SenderNameTests(unittest.TestCase):
     def test_one_to_one_without_prefix_uses_the_chat_name(self):
         p = self.FakeMessages([self.row('晚上开会')], {'boss': ('张三', '', 0)})
         self.assertEqual(p.messages('boss')[0]['name'], '张三')
+
+    def test_sender_id_is_looked_up_once_per_shard(self):
+        rows = [dict(self.row('消息'), create_time=1700000000 + i)
+                for i in range(100)]
+        p = self.FakeMessages(rows, {})
+        self.assertEqual(len(p.messages('boss')), 100)
+        self.assertEqual(p.self_id_calls, ['message/message_0.db'])
 
     def test_looks_like_raw_id(self):
         for raw in ('12345678901234567@openim', '12345@chatroom', 'wxid_abc', '987654321'):
