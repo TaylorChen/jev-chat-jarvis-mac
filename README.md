@@ -87,7 +87,7 @@ CREATE TABLE Msg_48d3e17789e8816e9b1b6079fe641632(
 ```
 
 - 它会 `sudo codesign --force --deep --sign - /Applications/WeChat.app` 去掉 Hardened Runtime，然后用 LLDB 在密钥派生处断一次点抓 passphrase，按每库 salt 做 PBKDF2 派生并用 HMAC 校验。**首次要按提示在微信里退出登录再重新登录一次**。微信自动更新后可能需要重做重签名。
-- 密钥写到 `~/Library/Application Support/jev-jarvis/wechat_keys.json`（0600），passphrase 缓存在 `~/.wcdb-key-tool/wechat-passphrase.json`（0600），都在仓库之外；早期手工 clone 到 `~/python/wcdb-key-tool/` 的布局仍然兼容读取。
+- 密钥写到 `~/Library/Application Support/jev-jarvis/wechat_keys.json`（0600），passphrase 缓存在 `~/.wcdb-key-tool/wechat-passphrase.json`（0600），都在仓库之外；默认提取流程**不会生成明文数据库快照**。早期手工 clone 到 `~/python/wcdb-key-tool/` 的布局仍然兼容读取。
 - 微信库始终以 `-readonly` 打开，我们不对微信文件做任何写入、不注入、不 hook，也不接触微信的网络通信。上述 `sudo` 与重签名只发生在提取密钥这一步。
 
 ### 分发给别人用之前，先看这一节
@@ -120,14 +120,14 @@ CREATE TABLE Msg_48d3e17789e8816e9b1b6079fe641632(
 同一套本地库还有两个命令行/窗口工具（不经过悬浮窗）：
 
 ```bash
-uv run python src/history_analyze.py list --top 15        # 加 --live 直读实时库，不加则读解密快照
-uv run python src/history_analyze.py summary "某人"        # LLM 议题/结论/承诺待办/风险
-uv run python src/history_analyze.py intent  "某人"        # 对方消息抽样跑本地意图判断（全本地，不出网）
-uv run python src/history_analyze.py reply   "某人"        # 该会话最新未回复消息 → 按话术生成候选回复
-uv run python src/history_ui.py                          # 原生窗口：会话列表 + 上面三种分析
+uv run python src/history_analyze.py --live list --top 15      # 直接只读实时加密库
+uv run python src/history_analyze.py --live summary "某人"      # LLM 议题/结论/承诺待办/风险
+uv run python src/history_analyze.py --live intent  "某人"      # 对方消息抽样跑意图判断
+uv run python src/history_analyze.py --live reply   "某人"      # 最新未回复消息 → 按话术生成候选
+JEV_LIVE_DB=1 uv run python src/history_ui.py                   # 原生窗口：会话列表 + 三种分析
 ```
 
-`summary`/`reply` 会把对话文本发给生成层配置的 LLM；`intent` 与整个悬浮窗的意图判断路径不出网。
+`summary`/`reply` 会把对话文本发给生成层配置的 LLM；`intent` 和悬浮窗判断在未配置 TypeSafe/Jev key 时使用本地模型，配置后会把判断上下文发给对应服务。默认密钥提取不创建快照；只有手工准备了仓库外快照时才省略 `--live`。
 
 ## 用法
 
@@ -135,7 +135,7 @@ uv run python src/history_ui.py                          # 原生窗口：会话
 
 第一次启动会自动退回 OCR 读屏，并弹一次提示告诉你怎么开启数据库直读（在终端跑 `./tools/extract_wechat_keys.command`，然后用「模型设置 → 感知 · 数据源」切到数据库直读）；读屏路径需要「屏幕录制」权限（系统设置 › 隐私与安全性 › 录屏与系统录音，给 **jev-jarvis** 打开），**退出重开**生效。「填入」另需「辅助功能」权限，第一次点会弹系统授权框。v0.3.1 及更早的旧版本还需把 **python3.12** 那条一并打开。
 
-缺少可用的 uv 时，两种启动入口都先完整下载并执行官方安装脚本（下载含超时和重试），失败后尝试已有的 Homebrew。失败提示区分网络、证书、磁盘和安装器错误，详细输出见 `~/Library/Logs/jev-jarvis.log`。官方脚本安装到 `~/.local/bin`，不修改 shell 配置。
+缺少固定版本 `uv 0.12.18` 时，两种启动入口都会从 Astral 官方不可变 Release 下载对应安装脚本，校验内置 SHA256 后才执行并安装到 `~/.local/bin`；校验失败、版本不符或下载失败都会停止，不再回退执行浮动脚本或自动安装 Homebrew 最新版。详细输出见 `~/Library/Logs/jev-jarvis.log`。
 
 `.app` 启动时会按包内 `uv.lock` 的哈希和已有运行环境核对一次：对得上就直接启动，对不上就**只补装依赖、不重建环境**（升级后首次启动可能多等几秒；只有解释器版本不对才会重建）。所以新版包新增的依赖不会因为「环境早就建好了」而静默缺失。
 
@@ -153,7 +153,7 @@ uv run python probe/bootstrap_regression.py      # 两种启动入口的离线�
 
 ## 配置
 
-两层、两个 key、**都可以不填**：判断层不填走本地 decider-2b（首次下载约 7 GB）；生成层打包版内置共享 key，不配也能出候选。全部配置在一个 env 文件（**不提供第二种格式**）：
+两层、两个 key：判断层不填走本地 decider-2b（首次下载约 7 GB）；生成层不填则不生成候选，但感知和本地判断仍可使用。全部配置在一个 env 文件（**不提供第二种格式**）：
 
 ### 可视化配置（#18）
 
@@ -163,8 +163,8 @@ uv run python probe/bootstrap_regression.py      # 两种启动入口的离线�
 - 窗口编辑 `$XDG_CONFIG_HOME/jev-jarvis/env`（未设置时为 `~/.config/jev-jarvis/env`），显示具体路径。只修改所编辑服务的字段，保留其他配置、注释和未识别行，文件权限设为 `600`。文件被其他程序修改时拒绝覆盖，需重新打开窗口。
 - 填好地址与密钥，点击「获取模型列表」从该服务的 `/models` 接口动态获取，再下拉选择；不内置模型清单。Jev 按官方 `models[].name` 读取（当前列表为别名，未列出的版本号仍可手填）；OpenAI/Anthropic 按 `data[].id` 读取。接口不支持、失败或返回空列表时明确提示，仍可手填，不自动换模型或服务。空下拉显示「暂无」（仅作提示，不作为模型保存或调用），仍可手填；底部动态提示以蓝色显示进行状态、绿色显示成功、红色显示错误。列表可见不代表一定有生成权限，选定后再测试。
 - 「测试连接」使用窗口内**尚未保存**的地址、密钥和模型发起实际调用，仅发送固定问候语，不读取微信内容；可能产生少量服务费用。生成层必须返回非空文字才算成功，不能用 `--check` 的配置解析成功代替连接成功。
-- 密钥掩码显示；窗口仅读取所编辑文件中的值，不把环境变量、项目 `.env` 或内置共享密钥复制进用户文件。各配置页顶部突出显示本次启动正在使用自己的密钥、内置共享密钥或本地判断，以及实际来源；生成页同时标明当前启用的服务，优先级保留在窗口下方。
-- 环境变量优先于用户 env，用户 env 优先于项目 `.env`；生成层 OpenAI 组优先于 Anthropic 组，均未配置才使用内置共享密钥。清空当前文件的密钥不会禁用其他来源中的密钥。由终端或启动器导出的值也显示为「环境变量」。
+- 密钥掩码显示；窗口仅读取所编辑文件中的值，不把环境变量或项目 `.env` 中的密钥复制进用户文件。各配置页顶部显示本次启动使用的实际来源；生成页同时标明当前启用的服务。
+- 环境变量优先于用户 env，用户 env 优先于项目 `.env`；生成层 OpenAI 组优先于 Anthropic 组。两组均未配置时不发起生成请求。清空当前文件的密钥不会禁用其他来源中的密钥。由终端或启动器导出的值也显示为「环境变量」。
 - API 格式由密钥组决定：`OPENAI_*` 使用 OpenAI 格式，`ANTHROPIC_*` 使用 Anthropic 格式；自定义地址不需要包含服务名称。Ollama 可填 `http://localhost:11434/v1`、密钥 `ollama`，模型从本地服务获取或手填。Jev 地址沿用判断层约定，不含末尾 `/v1`。
 - 钥匙串：不新增钥匙串读写。如果原 env 用 `$(security find-generic-password …)` 等 shell 表达式提供密钥，窗口不执行表达式、不展示其内容，未输入新密钥时保留原行；仍由已有启动器执行。要在窗口测试该服务，需明确输入密钥；保存将用输入值替换原表达式。外部注入的密钥继续遵循环境变量优先级。
 - `JEV_BOXES`、`JEV_TONES`、`OPENAI_EXTRA_BODY`、`JEV_DB_WATCH`、`JEV_LIVE_DIR`、`JEV_DB_DIR` 暂仍通过 env 配置，保存窗口不会改动它们（数据源与密钥文件位置已在「感知 · 数据源」页内可编辑）。OpenAI 连接测试沿用当前启动的 `OPENAI_EXTRA_BODY`；完整话术管理等留待后续扩展。
@@ -198,7 +198,8 @@ chmod 600 ~/.config/jev-jarvis/env
 |---|---|---|---|
 | 判断层本地模型 `decider-2b`（不配判断层 key 才会下载，判断+排序共用） | `~/.cache/huggingface/hub/models--Mapika--decider-2b` | ~7 GB | `rm -rf ~/.cache/huggingface/hub/models--Mapika--decider-2b`；之后走本地判断会重新下载 |
 | Python 运行环境（venv） | `~/Library/Application Support/jev-jarvis/venv` | ~0.7 GB | 删除 .app 不会连带删它，需手动删 |
-| 数据库直读的密钥 / 解密快照（默认数据源，没提取过就没有） | `~/Library/Application Support/jev-jarvis/wechat_keys.json`、`.../decrypted` | 密钥 ~5 KB；快照随追平进度增长（GB 级） | 删掉即退回纯 OCR 读屏（应用不会再直读），重新提取才会再有 |
+| 数据库直读的密钥 | `~/Library/Application Support/jev-jarvis/wechat_keys.json` | ~5 KB | 删掉即退回 OCR 读屏；重新提取才会再有 |
+| 显式创建的解密快照（默认不生成） | `JEV_DB_DIR` 指定的仓库外目录 | GB 级 | 确认不再需要后手工删除 |
 
 生成层配 Ollama 的话模型在 Ollama 自己的目录（`~/.ollama`），非本项目下载。
 密钥提取的 passphrase 缓存在 `~/.wcdb-key-tool/wechat-passphrase.json`（0600，内置的第三方工具所写）。
@@ -229,7 +230,7 @@ chmod 600 ~/.config/jev-jarvis/env
 - 配置界面自测：`uv run python -B -m unittest discover -s tests`；macOS 原生窗口与按钮流程：`uv run python -B probe/settings_smoke.py`（临时配置 + 本地测试服务，不使用个人密钥）。
 - 数据源相关自测：`uv run python -B probe/live_db_smoke.py`（8 项实时库冒烟，需微信在跑 + 已提取密钥，只读）、`uv run python -B probe/history_ui_smoke.py`（历史会话窗口冒烟，6 秒自动退出）、`uv run python src/wechat_keys.py`（密钥状态与下一步）。纯函数与缓存策略在 `tests/test_live_db.py`，不需要真库。
 - 第三方代码：`tools/wcdb_key_tool/` 是**原样引入**的 wcdb-key-tool（MIT，见 [NOTICE.md](tools/wcdb_key_tool/NOTICE.md)，含上游提交号与 SHA256）；改它请走「重新复制 + 更新 NOTICE」，本项目自己的逻辑放 `src/wechat_keys.py`。
-- 打包 `./packaging/build_app.sh`；发版 `./packaging/release.sh --publish`（干净 worktree 构建 + 解压回验 + gh release）。版本号只有 `pyproject.toml` 一处；有开发者证书可加 `--sign "Developer ID Application: ..."`
+- 打包 `./packaging/build_app.sh`；发版 `./packaging/release.sh --publish`（脚本会在构建前后强制检查干净 worktree，再做 zip 解压回验 + SHA256 + gh release）。版本号只有 `pyproject.toml` 一处；固定图标资产在 `packaging/AppIcon.icns`；有开发者证书可加 `--sign "Developer ID Application: ..."`
 - 架构一句话：默认「只读打开微信加密库 → 取最近真实历史」，退回读屏时换成「进程内抓微信窗口 → Vision OCR（只扫聊天区）」；之后都是 本地 decider-2b 出意图/风险 → LLM 并发出候选 → 本地排序 → 悬浮窗 NSPanel。抓窗口不抓屏：微信被挡住也能抓，悬浮窗不污染 OCR
 
 ## 许可与免责

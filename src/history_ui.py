@@ -133,7 +133,8 @@ def _run_intent(ctl, username: str, display: str):
                     lambda i=i, n=len(sample): _status(
                         ctl, f"{"Jev 云端" if cloud else "本地模型"}判断中 {i}/{n}…"))
         n = len(sample)
-        out = [f"# 意图分布 — {display} → 我（抽样 {n} 条，本地推理，未出网）", ""]
+        mode = "Jev 云端，消息已发送到配置服务" if cloud else "本地推理，未出网"
+        out = [f"# 意图分布 — {display} → 我（抽样 {n} 条，{mode}）", ""]
         for intent, c in sorted(dist.items(), key=lambda kv: -kv[1]):
             bar = "█" * round(c / n * 30)
             out.append(f"{intent:<12} {c:>4}  {c / n * 100:5.1f}%  {bar}")
@@ -412,8 +413,12 @@ class Controller(NSObject):
     # ---------- ObjC: 刷新 / 动作 ----------
 
     def refresh_(self, sender):
-        self.convs = self.provider.conversations(
-            250, with_counts=not getattr(self, "_live", False))
+        try:
+            self.convs = self.provider.conversations(
+                250, with_counts=not getattr(self, "_live", False))
+        except Exception as e:
+            _status(self, f"刷新失败：{type(e).__name__}: {str(e)[:80]}")
+            return
         self._apply_filter()
         # 分类按钮带上各自数量，个人/群聊不再被公众号淹没
         for i, label in enumerate(CATEGORIES):

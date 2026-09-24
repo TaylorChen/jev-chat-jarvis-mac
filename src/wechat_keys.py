@@ -6,7 +6,7 @@
 要每个库各自的一把密钥（由 `tools/wcdb_key_tool/` 里原样引入的 wcdb-key-tool
 提取），本模块负责三件事：
 
-  * 决定密钥文件与解密快照放在哪 —— 个人数据一律在仓库之外（`git add -A` 也带不走）
+  * 决定密钥文件与显式解密快照放在哪 —— 个人数据一律在仓库之外
   * 判断「现在有没有可用密钥」，好让界面和日志给出能照做的提示，而不是等读取失败
   * 给出提取命令（含 sudo 与重签名前提），由 `tools/extract_wechat_keys.command` 执行
 
@@ -171,7 +171,7 @@ def resolve_source(cli: str | None = None) -> tuple[str, str]:
     return source, ""
 
 
-def extraction_command(decrypt: bool = True) -> str:
+def extraction_command(decrypt: bool = False) -> str:
     """给人照抄的命令（需要 sudo 与 lldb；首次还要退出登录再登录微信）。"""
     suffix = " --decrypt" if decrypt else ""
     return (f"sudo {sys.executable} {TOOL} extract "
@@ -200,7 +200,7 @@ def doctor() -> int:
     path = keys_file()
     print(f"密钥文件: {path}（{'存在' if path.exists() else '不存在'}）")
     print(f"状态: {status_line()}")
-    print(f"解密快照目录: {decrypted_dir()}")
+    print(f"显式解密快照目录: {decrypted_dir()}")
     print(f"内置工具: {TOOL}（{'存在' if TOOL.exists() else '缺失'}）")
     cipher = sqlcipher_path()
     print(f"sqlcipher: {cipher or '缺失 —— 需要 brew install sqlcipher（读取加密库用）'}")

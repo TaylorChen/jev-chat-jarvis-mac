@@ -13,6 +13,7 @@ config.local.json
 # 运行产物 —— 可能包含私人聊天内容
 # ══════════════════════════════════════════════════════════════
 results/
+/decrypted/
 debug-captures/
 .ocr-cache/
 *.log
@@ -25,6 +26,7 @@ debug-captures/
 # ══════════════════════════════════════════════════════════════
 *.app/
 *.icns
+!packaging/AppIcon.icns
 *.iconset/
 build/
 dist/

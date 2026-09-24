@@ -69,7 +69,7 @@ userconfig.load()   # ~/.config/jev-jarvis/env -> os.environ (Finder apps inheri
 from perception import (  # noqa: E402
     read_conversation, screen_capture_ok, request_screen_capture, warm_ocr)
 from judge import make_judge  # noqa: E402
-from generate import BUILTIN_SOURCE, Generator, load_credentials  # noqa: E402
+from generate import Generator, load_credentials  # noqa: E402
 import styles  # noqa: E402
 import fill  # noqa: E402
 import wechat_keys  # noqa: E402
@@ -167,6 +167,13 @@ def _log(msg: str) -> None:
     depended on how the user happened to launch it. The inode check stops the .app case
     from writing every line twice.
     """
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(fd)
+        os.chmod(LOG_PATH, 0o600)       # repair files created by older versions/umasks
+    except OSError:
+        pass
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
     try:
@@ -663,11 +670,15 @@ class HudController(NSObject):
         if reader is None:
             return []
         provider = reader.provider
-        rows = provider._query(
-            "session/session.db",
-            "SELECT username, unread_count AS u FROM SessionTable "
-            "WHERE last_clear_unread_timestamp > 0 OR unread_count > 0 "
-            f"ORDER BY sort_timestamp DESC LIMIT {int(n)}")
+        try:
+            rows = provider._query(
+                "session/session.db",
+                "SELECT username, unread_count AS u FROM SessionTable "
+                "WHERE last_clear_unread_timestamp > 0 OR unread_count > 0 "
+                f"ORDER BY sort_timestamp DESC LIMIT {int(n)}")
+        except Exception as e:
+            _log(f"会话列表读取失败 {type(e).__name__}: {str(e)[:60]}")
+            return []
         out = []
         for r in rows:
             if provider.category(r["username"]) == "公众号":
@@ -724,7 +735,7 @@ class HudController(NSObject):
         self._push("applySource:", self._source_badge())
         self._render("status", f"已跟随「{self._pin_label}」" if username
                      else "已恢复：跟随你点开的会话", PALETTE["muted"])
-        _log(f"跟随会话: {self._pin_label or '自动'}")
+        _log("跟随会话: 手动" if username else "跟随会话: 自动")
 
     def openSettings_(self, sender):
         from settings import SettingsController
@@ -1425,7 +1436,7 @@ class HudController(NSObject):
                 # 没有抓屏也没有 OCR：照 OCR 那行打会变成「抓取 0ms + OCR 0ms」，
                 # 日志是唯一的排查面，不能报不存在的阶段
                 _log(f"读库 {t.get('db', 0):.0f}ms · 读到 {len(msgs)} 条"
-                     f"（对方 {len(thems)} 条）· 会话「{res.get('chat_title') or '?'}」{ctx_note}")
+                     f"（对方 {len(thems)} 条）{ctx_note}")
             else:
                 # Vision loads on the first call and costs ~2x steady state; saying so keeps
                 # a one-off from being read as a regression (same reason the judge line does)
@@ -1560,8 +1571,9 @@ class HudController(NSObject):
                 if (verdict is not None and not self._paused and text == self.last_seen
                         and epoch == self._reply_epoch):
                     self._prejudge_result = (text, verdict, sender, prev, epoch)
-            except Exception:
-                pass                  # a resident worker must not die on one bad request
+            except Exception as e:
+                self._prejudging = False
+                _log(f"预判 worker 异常 {type(e).__name__}: {str(e)[:60]}")
 
     @objc.python_method
     def _pregen_loop(self):
@@ -1587,7 +1599,8 @@ class HudController(NSObject):
                 gen = None
                 try:
                     gen = self.generator.generate(text, "", list(tones), context)
-                except Exception:
+                except Exception as e:
+                    _log(f"预生成失败 {type(e).__name__}: {str(e)[:60]}")
                     gen = None        # a failed early run just means the settle path regenerates
                 # store BEFORE clearing _pregen_running, so _take_pregen never observes
                 # "not running" without the result already visible
@@ -1595,8 +1608,9 @@ class HudController(NSObject):
                         and epoch == self._reply_epoch):
                     self._pregen_result = (text, tones, gen, epoch)
                 self._pregen_running = False
-            except Exception:
+            except Exception as e:
                 self._pregen_running = False
+                _log(f"预生成 worker 异常 {type(e).__name__}: {str(e)[:60]}")
 
     @objc.python_method
     def _take_pregen(self, text: str, tones: tuple) -> tuple[dict | None, float]:
@@ -2078,9 +2092,8 @@ def warn_if_no_generation_key() -> None:
 
     OPENAI_* and ANTHROPIC_* are two ways to configure the same generation layer, so this
     fires only when NEITHER is set: either one on its own is a complete configuration.
-    A packaged build also carries a shared default (src/builtin.py), so this dialog only
-    appears when that default was deliberately emptied out. TypeSafe is not checked — it
-    has a local fallback, so it is never missing, only different.
+    TypeSafe is not checked — it has a local fallback, so it is never missing, only
+    different.
 
     Drawn with osascript rather than NSAlert, which was measured to not work here: an
     accessory app cannot activate itself (NSApp.isActive stays False after
@@ -2144,9 +2157,8 @@ def main() -> None:
     _base, _key, _model, _src, _api = load_credentials()
     _log(f"启动 · 数据源 {'数据库直读' if controller._db_mode else 'OCR 读屏'}"
          f" · 判断层 "
-         f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY') else '本地 decider-2b'}"
+         f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY', 'JEV_API_KEY') else '本地 decider-2b'}"
          f" · 生成层 {(_base + ' / ' + _model) if _key else '未配置（候选区会是空的）'}"
-         + ("（内置默认）" if _src == BUILTIN_SOURCE else "")
          + (" · YOLO 框开" if controller._show_boxes else ""))
     controller._show()
     # Warm the heavy one-off loads (Vision OCR, judge model) while the panel is idle, so

@@ -36,6 +36,16 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+require_clean_publish_tree() {
+    if [ "$PUBLISH" = 1 ] && [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" ]; then
+        echo "--publish 要求干净 worktree：请先提交或移走未提交改动" >&2
+        exit 1
+    fi
+}
+
+# Fail before build so a publish attempt can never package uncommitted source by accident.
+require_clean_publish_tree
+
 VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$ROOT/pyproject.toml" | head -1)"
 if [ -z "$VERSION" ]; then
     echo "读不到 pyproject.toml 里的 version" >&2
@@ -77,7 +87,7 @@ rm -f "$ZIP"
 echo "==> 压缩"
 # --keepParent: the zip must contain jev-jarvis.app/ itself, so unzipping gives an app
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
-( cd "$OUT" && shasum -a 256 "$(basename "$ZIP")" > SHA256SUMS )
+( cd "$OUT" && LC_ALL=C LANG=C shasum -a 256 "$(basename "$ZIP")" > SHA256SUMS )
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -107,6 +117,8 @@ echo "    文件: $ZIP"
 echo "    校验: $(cat "$OUT/SHA256SUMS")"
 
 if [ "$PUBLISH" = 1 ]; then
+    # Recheck after build/sign/package: a concurrent edit must not race the first gate.
+    require_clean_publish_tree
     echo "==> 建 GitHub Release"
     command -v gh >/dev/null 2>&1 || { echo "    没装 gh，先 brew install gh" >&2; exit 1; }
     TAG="v$VERSION"

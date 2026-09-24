@@ -175,9 +175,10 @@ def cmd_reply(p: HistoryProvider, args) -> int:
     try:
         verdict = make_judge().judge(last_their["text"])
         intent = verdict["intent"]
-        print(f"本地判断: 意图={intent} 置信={verdict['confidence']:.2f} 风险={verdict['risk']}")
+        print(f"判断({verdict.get('backend', 'unknown')}): 意图={intent} "
+              f"置信={verdict['confidence']:.2f} 风险={verdict['risk']}")
     except Exception as e:
-        print(f"本地判断跳过（{e}），直接生成")
+        print(f"判断跳过（{e}），直接生成")
     print("生成候选回复…")
     gen = Generator().generate(last_their["text"], intent, None, context)
     for grp in gen.get("groups", []):

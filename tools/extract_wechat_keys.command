@@ -7,15 +7,15 @@
 #   2. 用本项目内置的 wcdb-key-tool（tools/wcdb_key_tool/，原样引入的第三方工具）
 #      提取每个库的密钥；首次需要你在微信里退出登录再重新登录一次
 #
-# 提取出的密钥与解密快照都写到应用数据目录（仓库之外），并把属主改回当前用户，
-# 否则 sudo 生成的文件只有 root 能读，应用反而读不到。
+# 这里只提取密钥，不生成明文数据库快照。密钥文件在 sudo 工具启动前就以 0600
+# 创建，避免工具运行或中断期间出现宽松权限窗口。
 set -e
+umask 077
 cd "$(dirname "$0")/.." || exit 1
 ROOT="$PWD"
 
 APP_SUPPORT="$HOME/Library/Application Support/jev-jarvis"
 KEYS_FILE="$APP_SUPPORT/wechat_keys.json"
-DECRYPTED_DIR="$APP_SUPPORT/decrypted"
 TOOL="$ROOT/tools/wcdb_key_tool/wcdb_key_tool_macos.py"
 
 PY="$(command -v python3 || true)"
@@ -64,8 +64,9 @@ fi
 print -r -- "即将："
 print -r -- "  1) sudo codesign --force --deep --sign - /Applications/WeChat.app"
 print -r -- "     （微信会被 ad-hoc 重签名；微信自动更新后需要重做这一步）"
-print -r -- "  2) sudo $PY $TOOL extract --output $KEYS_FILE --decrypt"
+print -r -- "  2) sudo $PY $TOOL extract --output $KEYS_FILE"
 print -r -- "     （首次会等你在微信里退出登录再登录一次，最多等 180 秒）"
+print -r -- "     （只提取密钥，不生成明文数据库快照）"
 print -r -- ""
 print -r -- "只提取你自己账号、你自己设备上的密钥；不会发送任何数据。"
 print -rn -- "继续？[y/N] "
@@ -76,18 +77,25 @@ case "$answer" in
 esac
 
 mkdir -p "$APP_SUPPORT"
+chmod 700 "$APP_SUPPORT"
+if [ -L "$KEYS_FILE" ] || { [ -e "$KEYS_FILE" ] && [ ! -f "$KEYS_FILE" ]; }; then
+    print -r -- "密钥路径不是普通文件，已停止：$KEYS_FILE"
+    exit 1
+fi
+if [ ! -e "$KEYS_FILE" ]; then
+    : > "$KEYS_FILE"
+fi
+chmod 600 "$KEYS_FILE"
 
 print -r -- "\n[1/3] 重签名微信（去 Hardened Runtime）…"
 sudo codesign --force --deep --sign - /Applications/WeChat.app
 
 print -r -- "\n[2/3] 提取密钥（接下来请按提示在微信里退出登录再重新登录）…"
-sudo "$PY" "$TOOL" extract --output "$KEYS_FILE" --decrypt
+sudo "$PY" "$TOOL" extract --output "$KEYS_FILE"
 
-print -r -- "\n[3/3] 把生成的结果交还给当前用户…"
-sudo chown -R "$(id -u):$(id -g)" "$KEYS_FILE" "$APP_SUPPORT/decrypted" 2>/dev/null || true
-[ -f "$KEYS_FILE" ] && chmod 600 "$KEYS_FILE"
-[ -d "$DECRYPTED_DIR" ] && chmod 700 "$DECRYPTED_DIR"
+print -r -- "\n[3/3] 校验密钥文件权限…"
+sudo chown "$(id -u):$(id -g)" "$KEYS_FILE"
+chmod 600 "$KEYS_FILE"
 
 print -r -- "\n完成。密钥：$KEYS_FILE"
-print -r -- "解密快照：$DECRYPTED_DIR"
 print -r -- "现在可以在「模型设置 → 数据源」里选「数据库直读」，或设置 JEV_SOURCE=db 后重启。"

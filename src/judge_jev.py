@@ -38,7 +38,7 @@ TIMEOUT = 30
 
 def jev_configured() -> bool:
     """True when a TypeSafe key is present — callers prefer Jev over the local model."""
-    return bool(userconfig.get("TYPESAFE_API_KEY", "JEV_API_KEY"))
+    return bool(userconfig.provider("TYPESAFE", "JEV_API_KEY")["key"])
 
 
 class JevJudge:
@@ -48,9 +48,10 @@ class JevJudge:
 
     def __init__(self, base: str | None = None, key: str | None = None,
                  model: str | None = None, timeout: int = TIMEOUT):
-        self.base = (base or userconfig.get("TYPESAFE_BASE_URL") or DEFAULT_BASE).rstrip("/")
-        self.key = key or userconfig.get("TYPESAFE_API_KEY", "JEV_API_KEY")
-        self.model = model or userconfig.get("TYPESAFE_MODEL") or DEFAULT_MODEL
+        configured = userconfig.provider("TYPESAFE", "JEV_API_KEY")
+        self.base = (base or configured["base"] or DEFAULT_BASE).rstrip("/")
+        self.key = key or configured["key"]
+        self.model = model or configured["model"] or DEFAULT_MODEL
         self.timeout = timeout
         self._last_url = ""
 
@@ -123,6 +124,8 @@ class JevJudge:
 
     # ------------------------------------------------------------------ transport
     def _post(self, payload: dict) -> dict:
+        if not self.key:
+            raise ValueError("未配置 TypeSafe key。")
         url = f"{self.base}/v1/systemone"
         self._last_url = url
         # 与生成层共用 keep-alive 池（src/generate.py）：判断+排序各一次网络调用，

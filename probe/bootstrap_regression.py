@@ -9,6 +9,7 @@ the native Mach-O launcher is outside this offline test's scope.
 import argparse
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -24,7 +25,7 @@ export FIXTURE_ROOT="$PWD"
 export TRACE="$PWD/trace"
 mkdir -p "$HOME" "$TMPDIR"
 case "$SCENARIO" in
-    existing|existing-venv)
+    existing|existing-venv|existing-old)
         mkdir -p "$HOME/.local/bin"
         cp "$FIXTURE_ROOT/uv" "$HOME/.local/bin/uv"
         chmod +x "$HOME/.local/bin/uv" ;;
@@ -73,6 +74,16 @@ brew() {
 }
 uv() { "$HOME/.local/bin/uv" "$@"; }
 osascript() { printf 'osascript %s\n' "$*" >> "$TRACE"; }
+shasum() {
+    case "$3" in
+        */uv.lock) printf '%s  %s\n' "$EXPECTED_LOCK_SHA" "$3"; return ;;
+    esac
+    if [ "$SCENARIO" = checksum-bad ]; then
+        printf '%064d  %s\n' 0 "$3"
+    else
+        printf '%s  %s\n' "$EXPECTED_UV_SHA" "$3"
+    fi
+}
 source "$1"
 '''
 
@@ -91,7 +102,9 @@ chmod +x "$HOME/.local/bin/uv"
 UV = r'''#!/bin/sh
 echo "uv $*" >> "$TRACE"
 case "$1" in
-    --version) echo 'uv 0.0.fixture' ;;
+    --version)
+        if [ "$SCENARIO" = existing-old ]; then echo 'uv 0.1.0';
+        else echo "uv ${EXPECTED_UV_VERSION}"; fi ;;
     sync)
         mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
         cp "$FIXTURE_ROOT/python" "$UV_PROJECT_ENVIRONMENT/bin/python"
@@ -146,7 +159,13 @@ def run_fixture(scenario, source=False, prepare=None, env_extra=None):
         if prepare:
             prepare(root)
         target = "source/start.command" if source else "jev test.app/Contents/Resources/launcher.zsh"
-        env = dict(os.environ, SCENARIO=scenario)
+        helper_text = (ROOT / 'packaging/bootstrap_uv.sh').read_text(encoding='utf-8')
+        version = re.search(r'^JEV_UV_VERSION="([^"]+)"', helper_text, re.M)
+        digest = re.search(r'^JEV_UV_INSTALLER_SHA256="([0-9a-f]{64})"', helper_text, re.M)
+        env = dict(os.environ, SCENARIO=scenario,
+                   EXPECTED_UV_VERSION=version.group(1) if version else 'missing',
+                   EXPECTED_UV_SHA=digest.group(1) if digest else '0' * 64,
+                   EXPECTED_LOCK_SHA=lock_hash())
         # 外层环境里的 XDG 配置目录不许漏进 fixture：生产脚本会优先读它，
         # 否则「默认读 ~/.config」这条断言会随开发者机器而变。
         env.pop("XDG_CONFIG_HOME", None)
@@ -173,6 +192,19 @@ def lock_hash():
 
 
 class BootstrapRegression(unittest.TestCase):
+    def test_checksum_mismatch_never_executes_installer(self):
+        completed, trace, log = run_launcher("checksum-bad")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("installer-ran", trace)
+        self.assertNotIn("app-started", trace)
+        self.assertIn("SHA256", log + completed.stdout + trace)
+
+    def test_existing_wrong_uv_version_is_not_accepted(self):
+        completed, trace, log = run_launcher("existing-old")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("app-started", trace)
+        self.assertIn("版本", log + completed.stdout + trace)
+
     def test_app_executes_successfully_downloaded_installer(self):
         completed, trace, log = run_launcher("success")
         self.assertIn("installer-ran", trace, "Downloaded installer was never executed")
@@ -205,14 +237,14 @@ class BootstrapRegression(unittest.TestCase):
         self.assertIn("binary download failed", log)
         self.assertNotIn("app-started", trace)
 
-    def test_homebrew_recovers_after_official_download_fails(self):
+    def test_download_failure_never_runs_unpinned_homebrew(self):
         for source in (False, True):
             with self.subTest(source=source):
                 completed, trace, log = run_launcher("brew", source=source)
-                self.assertEqual(completed.returncode, 0, completed.stderr + log)
+                self.assertNotEqual(completed.returncode, 0)
                 self.assertNotIn("installer-ran", trace)
-                self.assertIn("brew install uv", trace)
-                self.assertIn("app-started", trace)
+                self.assertNotIn("brew install uv", trace)
+                self.assertNotIn("app-started", trace)
 
     def test_existing_uv_skips_installation(self):
         for source in (False, True):
@@ -237,22 +269,22 @@ class BootstrapRegression(unittest.TestCase):
     def test_success_exit_without_uv_is_not_accepted(self):
         completed, trace, log = run_launcher("missing-binary")
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("uv 仍不可用", log)
+        self.assertIn("uv 版本为 不可用", log)
         self.assertNotIn("app-started", trace)
 
-    def test_brew_failure_preserves_both_failure_reasons(self):
+    def test_download_failure_preserves_the_original_reason(self):
         completed, trace, log = run_launcher("brew-fails")
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("超时", log)
-        self.assertIn("Homebrew 安装也失败（退出码 9）", log)
+        self.assertNotIn("brew install", trace)
         self.assertNotIn("app-started", trace)
 
-    def test_brew_also_recovers_from_installer_execution_failure(self):
+    def test_installer_execution_failure_does_not_fall_back_to_unpinned_brew(self):
         completed, trace, log = run_launcher("install-fails-brew")
-        self.assertEqual(completed.returncode, 0, completed.stderr + log)
+        self.assertNotEqual(completed.returncode, 0)
         self.assertIn("installer-ran", trace)
-        self.assertIn("brew install uv", trace)
-        self.assertIn("app-started", trace)
+        self.assertNotIn("brew install uv", trace)
+        self.assertNotIn("app-started", trace)
 
 
 class DependencySyncRegression(unittest.TestCase):

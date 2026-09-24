@@ -25,7 +25,7 @@ def pump(seconds):
 
 def main():
     now = int(time.time())
-    rows = [(now - (100 - i) * 60, 'them' if i % 3 else 'me', '石汀兰',
+    rows = [(now - (100 - i) * 60, 'them' if i % 3 else 'me', '测试用户甲',
              f'第 {i} 条历史消息，用来验证打开时停在最新一条') for i in range(100)]
     viewer = message_view.MessageViewer.alloc().initWithTitle_rows_budget_('冒烟会话', rows, 100)
     A.NSApplication.sharedApplication()

@@ -15,7 +15,6 @@ sys_path = str(Path(__file__).parent)
 if sys_path not in sys.path:
     sys.path.insert(0, sys_path)
 
-import builtin  # noqa: E402
 import userconfig  # noqa: E402
 import settings_config as config  # noqa: E402
 import wechat_keys  # noqa: E402
@@ -168,9 +167,8 @@ class SettingsController(NSObject):
                 if selected != prefix:
                     source += "；本页服务当前未启用"
             else:
-                summary = ("本次启动：正在使用内置共享密钥" if builtin.API_KEY
-                           else "本次启动：未配置生成密钥")
-                source = "应用内置" if builtin.API_KEY else "none"
+                summary = "本次启动：未配置生成密钥"
+                source = "none"
         detail = "来源：" + source.replace(str(Path.home()), "~") + "\n以下编辑内容保存后，需重启应用才会生效。"
         return summary, detail
 
@@ -232,7 +230,7 @@ class SettingsController(NSObject):
             0.0 if wechat_keys.has_keys() else 0.55, 0.35 if wechat_keys.has_keys() else 0.25, 0.10, 1))
         button = self.button(panel, "在终端里提取密钥…", "extractKeys:", 14, 34, 210)
         self.controls.append(button)
-        self.label(panel, "会在终端里先重签名微信、再提取密钥；密钥与解密快照都写到仓库之外。",
+        self.label(panel, "会在终端里先重签名微信、再提取密钥；不会生成明文数据库快照。",
                    234, 38, 444, 34, 12)
 
         item.setView_(panel)
@@ -357,7 +355,7 @@ class SettingsController(NSObject):
             extra = None
             if not listing and prefix == "OPENAI":
                 # Match generation's current extra-body setting, without changing it.
-                raw = userconfig.get("OPENAI_EXTRA_BODY") or builtin.EXTRA_BODY
+                raw = userconfig.get("OPENAI_EXTRA_BODY")
                 extra = json.loads(raw) if raw else {}
                 if not isinstance(extra, dict):
                     raise ValueError("OPENAI_EXTRA_BODY 必须是 JSON 对象。")

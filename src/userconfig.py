@@ -172,21 +172,22 @@ def source_of(*names: str) -> str:
     return "none"
 
 
-def provider(prefix: str) -> dict[str, str]:
+def provider(prefix: str, *key_aliases: str) -> dict[str, str]:
     """Resolve one provider's triple, anchored on its key.
 
     A key and its endpoint must come from the same place — mixing them means calling
     provider A with provider B's key and getting an unexplained 401. So whichever source
-    supplies the key also supplies base/model; other sources only fill the gaps.
+    supplies the key also supplies base/model. Missing values use the caller's safe
+    defaults; lower-priority sources may not redirect a higher-priority credential.
     """
-    key_name = f"{prefix}_API_KEY"
+    key_names = (f"{prefix}_API_KEY", *key_aliases)
     for src, vals in _sources():
-        if vals.get(key_name):
+        key = next((vals[name] for name in key_names if vals.get(name)), "")
+        if key:
             return {
-                "key": vals[key_name],
-                "base": vals.get(f"{prefix}_BASE_URL") or get(f"{prefix}_BASE_URL"),
-                "model": (vals.get(f"{prefix}_MODEL") or get(f"{prefix}_MODEL")
-                          or get("LLM_MODEL")),
+                "key": key,
+                "base": vals.get(f"{prefix}_BASE_URL", ""),
+                "model": vals.get(f"{prefix}_MODEL") or vals.get("LLM_MODEL", ""),
                 "source": src,
             }
     return {"key": "", "base": get(f"{prefix}_BASE_URL"),

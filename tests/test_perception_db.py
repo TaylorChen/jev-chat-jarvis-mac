@@ -15,7 +15,7 @@ class FakeProvider:
         self._sessions = sessions
         self._msgs = msgs
         self.names = {"boss_a": "张三", "dev_group": "开发者群", "quiet": "静静",
-                      "noisy_group": "刷屏群", "阿虎-安增辉": "安增辉"}
+                      "noisy_group": "刷屏群", "quiet_history": "历史联系人"}
 
     def _query(self, rel, sql):
         assert rel == "session/session.db"
@@ -132,13 +132,13 @@ class DBReaderTests(unittest.TestCase):
     def test_pin_overrides_the_clear_time_heuristic(self):
         """点开一个「没有未读」的会话时微信不写任何痕迹，只能手动钉住它。"""
         rd = self._reader(
-            [("noisy_group", 9000, 9999), ("阿虎-安增辉", 500, 100)],
+            [("noisy_group", 9000, 9999), ("quiet_history", 500, 100)],
             {"noisy_group": [msg(9000, "对方", "群里在刷屏", "群友")],
-             "阿虎-安增辉": [msg(500, "对方", "好的", "安增辉")]})
+             "quiet_history": [msg(500, "对方", "好的", "历史联系人")]})
         self.assertEqual(rd.read_conversation()["chat_title"], "刷屏群")   # 自动：clear 最大者
-        rd.set_pin("阿虎-安增辉")
+        rd.set_pin("quiet_history")
         r = rd.read_conversation()
-        self.assertEqual(r["chat_title"], "安增辉")
+        self.assertEqual(r["chat_title"], "历史联系人")
         self.assertEqual(r["messages"][-1].text, "好的")
         self.assertFalse(r["unchanged"], "钉住后第一次读必须按「切换」处理，面板才会跟过去")
 

@@ -4,7 +4,9 @@ Load the actual HUD methods through AST so the tests never start Cocoa, read the
 screen, load user credentials, or make model calls. Perception uses synthetic OCR.
 """
 import ast
+import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -81,6 +83,8 @@ class OutgoingTests(unittest.TestCase):
                      'applyPosition_', 'applyChat_', 'applyBoxes_']:
             setattr(h, name, Mock())
         self.queue = []
+        self.logs = []
+        HUD['_log'] = self.logs.append
         h.performSelectorOnMainThread_withObject_waitUntilDone_ = lambda s, p, w: self.queue.append((s, p))
 
     def read(self, blocks, title='chat'):
@@ -282,6 +286,29 @@ class OutgoingTests(unittest.TestCase):
             self.h._pregen_loop()
         self.assertIsNone(self.h._pregen_result)
 
+    def test_prejudge_worker_logs_unexpected_errors_and_keeps_running(self):
+        class Finished(BaseException):
+            pass
+        self.h._prejudge_req = ('broken',)
+        self.h._prejudge_event = Mock()
+        self.h._prejudge_event.wait.side_effect = [None, Finished()]
+        with self.assertRaises(Finished):
+            self.h._prejudge_loop()
+        self.assertTrue(any('预判 worker 异常' in line for line in self.logs))
+        self.assertFalse(self.h._prejudging)
+
+    def test_pregen_worker_logs_unexpected_errors_and_clears_running_flag(self):
+        class Finished(BaseException):
+            pass
+        self.h._pregen_req = ('broken',)
+        self.h._pregen_event = Mock()
+        self.h._pregen_event.wait.side_effect = [None, Finished()]
+        self.h._pregen_running = True
+        with self.assertRaises(Finished):
+            self.h._pregen_loop()
+        self.assertTrue(any('预生成 worker 异常' in line for line in self.logs))
+        self.assertFalse(self.h._pregen_running)
+
 
 class DbModeTests(unittest.TestCase):
     """JEV_DB_MODE=1：消息来自 live 加密库，测试替掉读取器本身。
@@ -315,6 +342,8 @@ class DbModeTests(unittest.TestCase):
                      'applyWaiting_'):
             setattr(h, name, Mock())
         self.queue = []
+        self.logs = []
+        HUD['_log'] = self.logs.append
         h.performSelectorOnMainThread_withObject_waitUntilDone_ = \
             lambda s, p, w: self.queue.append((s, p))
 
@@ -347,6 +376,11 @@ class DbModeTests(unittest.TestCase):
         HUD['read_conversation'].assert_not_called()
         self.h._db_reader.read_conversation.assert_called_once()
         self.assertEqual(self.h._db_read_count, 1)
+
+    def test_db_logs_never_contain_the_real_chat_title(self):
+        sentinel = 'PRIVATE_CUSTOMER_GROUP_9381'
+        self.db_read([self.msg('下午开会', 'them', '张三')], title=sentinel)
+        self.assertNotIn(sentinel, '\n'.join(self.logs))
 
     def test_synthetic_window_skips_ax_and_screen_capture(self):
         # 列不到微信窗口时不该去截屏做视觉兜底：DB 模式本就不该要录屏权限
@@ -398,6 +432,20 @@ class DbModeTests(unittest.TestCase):
         self.assertIsNone(self.h._pregen_req)
         self.h.applyWaiting_.assert_called()
 
+
+class LogFilePrivacyTests(unittest.TestCase):
+    def test_log_file_is_created_and_repaired_as_0600(self):
+        tree = ast.parse((ROOT / 'src/hud.py').read_text())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_log')
+        module = ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[]))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'jev.log'
+            path.write_text('old\n')
+            path.chmod(0o644)
+            scope = {'time': time, 'os': os, 'sys': sys, 'LOG_PATH': path}
+            exec(compile(module, str(ROOT / 'src/hud.py'), 'exec'), scope)
+            scope['_log']('safe')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 class ContextDepthTests(unittest.TestCase):
     """判断/生成各拿多少上下文：数据库直读默认用读到的全部历史（用户要的「基于近 100 条」）。"""
@@ -583,6 +631,15 @@ class PinSessionTests(unittest.TestCase):
             display_name=lambda u: names[u]))
         self.assertEqual(h._recent_sessions(5),
                          [('g1', '刷屏群（3 条未读）'), ('p1', '张三')])
+
+    def test_recent_sessions_query_failure_is_logged_not_silently_empty(self):
+        h = Harness()
+        logs = []
+        HUD['_log'] = logs.append
+        h._db_reader = SimpleNamespace(provider=SimpleNamespace(
+            _query=Mock(side_effect=RuntimeError('read failed'))))
+        self.assertEqual(h._recent_sessions(5), [])
+        self.assertTrue(any('会话列表读取失败' in line for line in logs))
 
     def test_pin_rows_start_with_auto(self):
         h = self._h()

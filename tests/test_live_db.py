@@ -10,16 +10,20 @@ Run: python -B -m unittest discover -s tests
 """
 import hashlib
 import inspect
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import live_db  # noqa: E402
 from history import HistoryProvider  # noqa: E402
 from live_db import (CIPHER_PRAGMAS, LiveProvider, _looks_like_raw_id,  # noqa: E402
-                     _resolve_sqlcipher, _row_content, _strip_sender_prefix, key_script)
+                     LiveQueryError, _resolve_sqlcipher, _row_content,
+                     _strip_sender_prefix, key_script)
 
 try:
     import zstandard
@@ -49,6 +53,45 @@ class KeyScriptTests(unittest.TestCase):
     def test_query_is_terminated_once(self):
         self.assertTrue(key_script('k', 'SELECT 1').endswith('SELECT 1;\n'))
         self.assertTrue(key_script('k', 'SELECT 1;\n').endswith('SELECT 1;\n'))
+
+
+class LiveQueryErrorTests(unittest.TestCase):
+    def _provider(self, root):
+        provider = LiveProvider.__new__(LiveProvider)
+        provider.live_dir = Path(root)
+        provider.keys = {'message/message_0.db': {'enc_key': '00'}}
+        provider._db_tables = {}
+        path = provider.live_dir / 'message/message_0.db'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'db')
+        return provider
+
+    def test_successful_empty_query_is_distinct_from_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = self._provider(root)
+            for stdout in ('', 'ok\n'):
+                result = SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+                with self.subTest(stdout=stdout), \
+                        patch('live_db.subprocess.run', return_value=result):
+                    self.assertEqual(provider._query('message/message_0.db', 'SELECT 1'), [])
+
+    def test_nonzero_and_malformed_results_raise_query_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = self._provider(root)
+            for result in (SimpleNamespace(returncode=1, stdout='', stderr='bad key'),
+                           SimpleNamespace(returncode=0, stdout='not json', stderr='')):
+                with self.subTest(result=result), \
+                        patch('live_db.subprocess.run', return_value=result), \
+                        self.assertRaises(LiveQueryError):
+                    provider._query('message/message_0.db', 'SELECT 1', attempts=1)
+
+    def test_failed_table_scan_is_never_cached_as_an_empty_database(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = self._provider(root)
+            provider._query = Mock(side_effect=LiveQueryError('read failed'))
+            with self.assertRaises(LiveQueryError):
+                provider._tables_of('message/message_0.db')
+            self.assertNotIn('message/message_0.db', provider._db_tables)
 
 
 class RowContentTests(unittest.TestCase):
@@ -129,7 +172,8 @@ class ShardTests(unittest.TestCase):
         rels = {}
         for name, tables in (('message_0.db', {self.table}),
                              ('message_1.db', {self.table, _md5_table('other')}),
-                             ('media_0.db', set())):
+                             ('media_0.db', set()),
+                             ('message_fts.db', set())):
             (Path(self.tmp) / 'message' / name).write_bytes(b'')
             rels[f'message/{name}'] = {'enc_key': '00' * 16, 'tables': tables}
         self.p = FakeLive(self.tmp, {k: {'enc_key': v['enc_key']} for k, v in rels.items()},
@@ -143,7 +187,7 @@ class ShardTests(unittest.TestCase):
     def test_shard_scan_is_cached_after_the_first_call(self):
         self.p._shards_for(self.user)
         first = self.p.count_queries('sqlite_master')
-        self.assertEqual(first, 3)          # 3 个库各扫一次
+        self.assertEqual(first, 2)          # media_0 不是消息分片，不能拿消息 key 规则扫描
         self.p._shards_for(self.user)
         self.assertEqual(self.p.count_queries('sqlite_master'), first,
                          '热路径不该再开 sqlcipher')
@@ -160,6 +204,10 @@ class ShardTests(unittest.TestCase):
         self.p.keys.pop('message/message_1.db')
         self.assertEqual([r for r, _t in self.p._shards_for(self.user)],
                          ['message/message_0.db'])
+
+    def test_non_message_databases_are_never_scanned_for_msg_tables(self):
+        self.p._shards_for(self.user)
+        self.assertEqual(self.p.count_queries('sqlite_master'), 2)
 
 
 class SelfIdTests(unittest.TestCase):
@@ -192,6 +240,18 @@ class SelfIdTests(unittest.TestCase):
         self.assertIsNone(p._self_id_of_rel(self.rel))
         self.assertEqual(p.count_queries('Name2Id'), 4)   # 两种列名 × 两次调用
 
+    def test_startup_probe_ignores_media_databases_without_name2id(self):
+        p = LiveProvider.__new__(LiveProvider)
+        p.keys = {
+            'message/media_0.db': {'enc_key': '00'},
+            'message/message_0.db': {'enc_key': '00'},
+            'message/biz_message_0.db': {'enc_key': '00'},
+        }
+        seen = []
+        p._self_id_of_rel = lambda rel: seen.append(rel) or 1
+        self.assertTrue(p._probe_self_id())
+        self.assertEqual(seen, ['message/message_0.db'])
+
     def _first_name2id_sql(self, p):
         for q in p.queries:
             if 'Name2Id' in q:
@@ -210,11 +270,49 @@ class CountManyTests(unittest.TestCase):
         self.assertEqual(p._count_many([]), {})
 
 
+class ThumbnailIsolationTests(unittest.TestCase):
+    def _provider(self, root):
+        provider = LiveProvider.__new__(LiveProvider)
+        provider.live_dir = Path(root) / 'db_storage'
+        provider._thumb_cache = {}
+        return provider
+
+    def _thumb(self, root, username, name, mtime):
+        folder = (Path(root) / 'msg' / 'attach'
+                  / hashlib.md5(username.encode()).hexdigest() / '2026-09' / 'Img')
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        path.write_bytes(b'jpeg')
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def test_nearby_image_from_another_chat_is_never_selected(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = self._provider(root)
+            own = self._thumb(root, 'chat-a', 'own_t_M.dat', 1000)
+            self._thumb(root, 'chat-b', 'closer_t_M.dat', 1001)
+            self.assertEqual(provider._thumb_for('chat-a', 1001), own)
+
+    def test_missing_conversation_attachment_tree_fails_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = self._provider(root)
+            self._thumb(root, 'chat-b', 'other_t_M.dat', 1000)
+            self.assertIsNone(provider._thumb_for('chat-a', 1000))
+
+    def test_thumbnail_cache_is_scoped_by_conversation(self):
+        with tempfile.TemporaryDirectory() as root:
+            provider = self._provider(root)
+            a = self._thumb(root, 'chat-a', 'a_t_M.dat', 1000)
+            b = self._thumb(root, 'chat-b', 'b_t_M.dat', 1000)
+            self.assertEqual(provider._thumb_for('chat-a', 1000), a)
+            self.assertEqual(provider._thumb_for('chat-b', 1000), b)
+
+
 
 class SenderNameTests(unittest.TestCase):
     """群消息的说话人：群昵称优先，昵称本身是原始 id 时查 contact.db 换真名。
 
-    实测踩到过：面板上写「来自 25984981997518334@openim」，判断 prompt 里也是一串 id。
+    实测踩到过：面板上展示原始 `@openim` 数字 id，判断 prompt 里也跟着不可读。
     """
 
     class FakeMessages(LiveProvider):
@@ -240,13 +338,13 @@ class SenderNameTests(unittest.TestCase):
                 'local_type': 1, 'content': content}
 
     def test_group_nickname_wins(self):
-        p = self.FakeMessages([self.row('王豪杰:\n好的')], {'me': ('', '我', 0)})
-        self.assertEqual(p.messages('g@chatroom')[0]['name'], '王豪杰')
+        p = self.FakeMessages([self.row('测试群友:\n好的')], {'me': ('', '我', 0)})
+        self.assertEqual(p.messages('g@chatroom')[0]['name'], '测试群友')
 
     def test_raw_id_prefix_is_resolved_through_contacts(self):
-        p = self.FakeMessages([self.row('25984981997518334@openim:\n训练完要发布')],
-                              {'25984981997518334@openim': ('', '石汀兰', 0)})
-        self.assertEqual(p.messages('g@chatroom')[0]['name'], '石汀兰')
+        p = self.FakeMessages([self.row('12345678901234567@openim:\n训练完要发布')],
+                              {'12345678901234567@openim': ('', '测试用户甲', 0)})
+        self.assertEqual(p.messages('g@chatroom')[0]['name'], '测试用户甲')
 
     def test_unresolvable_id_is_left_alone(self):
         p = self.FakeMessages([self.row('wxid_unknown:\n在吗')], {})
@@ -257,9 +355,9 @@ class SenderNameTests(unittest.TestCase):
         self.assertEqual(p.messages('boss')[0]['name'], '张三')
 
     def test_looks_like_raw_id(self):
-        for raw in ('25984981997518334@openim', '12345@chatroom', 'wxid_abc', '987654321'):
+        for raw in ('12345678901234567@openim', '12345@chatroom', 'wxid_abc', '987654321'):
             self.assertTrue(_looks_like_raw_id(raw), raw)
-        for name in ('石汀兰', '王豪杰', 'cheming', '石汀兰@尘锋', ''):
+        for name in ('测试用户甲', '测试群友', 'tester', '测试用户甲@测试群', ''):
             self.assertFalse(_looks_like_raw_id(name), name)
 
 

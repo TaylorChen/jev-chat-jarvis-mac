@@ -7,7 +7,7 @@ sys.path.insert(0, 'src')
 from live_db import LiveProvider
 
 p = LiveProvider()
-msgs = p.messages('49036329411@chatroom', limit=100, include_non_text=True)
+msgs = p.messages('12345678900@chatroom', limit=100, include_non_text=True)
 paths = [m['img_path'] for m in msgs if m.get('img_path')][:3]
 files = [Path(f).read_bytes() for f in paths]
 

@@ -12,7 +12,8 @@ import urllib.error
 import urllib.parse
 
 import userconfig
-from generate import _endpoint, http_post_json, Generator, ThinkingOnlyError
+from generate import (_endpoint, http_post_json, validate_transport_url,
+                      Generator, ThinkingOnlyError)
 
 PREFIXES = ("TYPESAFE", "OPENAI", "ANTHROPIC")
 FIELDS = ("API_KEY", "BASE_URL", "MODEL")
@@ -86,11 +87,7 @@ def write_settings(path: Path, original: str, changes: dict[str, str]) -> str:
 
 
 def validate_endpoint(base: str) -> str:
-    base = base.strip().rstrip("/")
-    p = urllib.parse.urlsplit(base)
-    if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password or p.query or p.fragment:
-        raise ValueError("服务地址需为 http(s) 地址，不包含用户名、密码、查询参数或片段。")
-    return base
+    return validate_transport_url(base)
 
 
 def list_models(prefix: str, base: str, key: str) -> list[str]:

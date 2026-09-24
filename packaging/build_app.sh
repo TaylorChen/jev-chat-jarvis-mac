@@ -85,6 +85,7 @@ cat > "$APP/Contents/Resources/launcher.zsh" <<'LAUNCHER'
 #!/bin/zsh
 # Bootstrap: prepare the uv environment, then run the app under the native launcher.
 set -u
+umask 077
 
 RES="$(cd "$(dirname "$0")" && pwd)"
 SUPPORT="$HOME/Library/Application Support/jev-jarvis"
@@ -95,6 +96,7 @@ VENV="$SUPPORT/venv"
 LOCK_STAMP="$SUPPORT/uv.lock.sha256"
 LOG="$HOME/Library/Logs/jev-jarvis.log"
 mkdir -p "$SUPPORT" "$(dirname "$LOG")"
+touch "$LOG" && chmod 600 "$LOG"
 
 # Finder launches have a minimal PATH; add the usual install locations for uv
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -116,10 +118,10 @@ source "$RES/app/packaging/bootstrap_uv.sh" || die "包内缺少 uv 安装脚本
 if ! command -v uv >/dev/null 2>&1; then
     # non-blocking: a Finder launch has no terminal, and a silent multi-minute wait
     # for uv + deps is indistinguishable from "the app is broken"
-    osascript -e 'display notification "首次启动：正在安装 uv（约 10 MB）" with title "jev-chat-jarvis"' >/dev/null 2>&1
+    osascript -e 'display notification "首次启动：正在安装固定版本 uv（约 20 MB）" with title "jev-chat-jarvis"' >/dev/null 2>&1
 fi
 if ! jev_ensure_uv "$LOG"; then
-    die "$JEV_UV_ERROR。也可手动运行 brew install uv 后重试。"
+    die "$JEV_UV_ERROR。请按日志提示安装固定版本 uv 后重试。"
 fi
 
 export UV_PROJECT_ENVIRONMENT="$VENV"
@@ -145,7 +147,7 @@ fi
 # 「新版包 + 老 venv」于是静默缺包（zstandard 就是这么漏的——数据库直读少了它
 # 只会少消息、不报错，因为压缩行解不开时按约定跳过）。按 uv.lock 的哈希打戳，
 # 戳不对就原地同步一次（不删 venv，省掉重下 torch）。
-lock_hash="$(shasum -a 256 "$RES/app/uv.lock" 2>/dev/null | awk '{print $1}')"
+lock_hash="$(LC_ALL=C LANG=C shasum -a 256 "$RES/app/uv.lock" 2>/dev/null | awk '{print $1}')"
 if [ "$ready" = 1 ] && [ -n "$lock_hash" ] && [ "$(cat "$LOCK_STAMP" 2>/dev/null)" != "$lock_hash" ]; then
     log "随包依赖清单与上次启动不同 —— 同步依赖（保留现有 venv）"
     ready=0
@@ -188,20 +190,12 @@ xcrun clang -std=c11 -Os -Wall -Wextra -Werror \
     -mmacosx-version-min=13.0 \
     "$ROOT/packaging/launcher.c" -o "$APP/Contents/MacOS/jev-jarvis"
 
-echo "==> 生成图标"
-PY="$ROOT/.venv/bin/python"
-# a clean release worktree has no .venv: build one from the lockfile instead of
-# falling through to a bare python3 (no pyobjc there, and the icon step fails muted)
-if ! [ -x "$PY" ] && command -v uv >/dev/null 2>&1; then
-    (cd "$ROOT" && uv sync --quiet)
-fi
-[ -x "$PY" ] || PY="$(command -v python3)"
-"$PY" "$ROOT/packaging/make_icon.py" "$APP/Contents/Resources/AppIcon.iconset" 2>/dev/null \
-  && iconutil -c icns "$APP/Contents/Resources/AppIcon.iconset" \
-       -o "$APP/Contents/Resources/AppIcon.icns" \
-  && rm -rf "$APP/Contents/Resources/AppIcon.iconset" \
-  && echo "    图标已生成" \
-  || echo "    跳过图标（生成失败，不影响使用）"
+echo "==> 安装固定图标资产"
+[ -f "$ROOT/packaging/AppIcon.icns" ] || {
+    echo "缺少 packaging/AppIcon.icns" >&2
+    exit 1
+}
+cp "$ROOT/packaging/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> 校验"
 check() {  # fail the build instead of shipping a broken bundle silently
@@ -225,16 +219,17 @@ check "第三方许可进包（MIT）"        "[ -f '$APP/Contents/Resources/app
 check "提取入口可执行"              "[ -x '$APP/Contents/Resources/app/tools/extract_wechat_keys.command' ]"
 check "依赖版本已冻结到 $PY_PIN"     "grep -q '${PY_PIN}' '$APP/Contents/Resources/launcher.zsh'"
 check "没夹带缓存"                  "[ ! -d '$APP/Contents/Resources/app/src/__pycache__' ]"
-# a key that leaked into src/ would ship to whoever gets the bundle. src/builtin.py is the
-# single deliberate exception — it holds the shared default that lets an unconfigured install
-# produce candidates at all, which is why that token must be scope-limited and capped.
-# Every other file still has to be clean, so accidental leaks stay caught.
-if grep -rEl --binary-files=without-match --exclude=builtin.py 'sk-[A-Za-z0-9]{20,}' \
-        "$APP/Contents/Resources/app/src" "$APP/Contents/Resources/app/.env.example" 2>/dev/null | grep -q .; then
-    echo "    ✗ 源码里疑似有 API key" >&2
+check "应用图标在"                  "[ -s '$APP/Contents/Resources/AppIcon.icns' ]"
+# Scan the final staged application tree, not selected source inputs: tools, bootstrap and
+# documentation ship too. These patterns cover the credential families this project uses
+# plus common cloud/private-key forms; any hit blocks the build for manual review.
+if grep -rEIl --binary-files=without-match \
+        '(sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[A-Z0-9_]*(API_KEY|TOKEN)[[:space:]]*=[[:space:]]*"[A-Za-z0-9_./+=-]{20,}")' \
+        "$APP/Contents/Resources/app" 2>/dev/null | grep -q .; then
+    echo "    ✗ 发布包里疑似有 API key、token 或私钥" >&2
     exit 1
 fi
-echo "    ✓ 没夹带 API key（builtin.py 的内置凭据是刻意保留的）"
+echo "    ✓ 没夹带 API key"
 
 echo "==> 完成"
 du -sh "$APP" | awk '{print "    包体积: " $1}'

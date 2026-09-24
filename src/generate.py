@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import http.client
+import ipaddress
 import io
 import json
 import os
@@ -34,7 +35,6 @@ import urllib.request
 
 from pathlib import Path
 
-import builtin
 import userconfig
 import styles
 
@@ -46,8 +46,38 @@ DEFAULT_OPENAI_BASE = "https://api.openai.com/v1"
 DEFAULT_ANTHROPIC_BASE = "https://api.anthropic.com"
 MISSING_HINT = ("未配置生成层 Key：候选回复需要它，判断/风险不需要。"
                 "设置 OPENAI_API_KEY（或 ANTHROPIC_API_KEY）后重启，见 README 配置章节。")
-# 用的是随包分发的凭据时报这个来源名，日志/--check 里能一眼分清「内置」和「你自己配的」
-BUILTIN_SOURCE = "内置默认"
+
+
+def validate_transport_url(url: str, *, allow_query: bool = False) -> str:
+    """Return a safe HTTP(S) URL; cleartext is allowed only on literal loopback hosts."""
+    value = (url or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(value)
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.username or parsed.password or parsed.fragment
+            or (parsed.query and not allow_query)):
+        raise ValueError("服务地址需为 http(s) 地址，不包含用户名、密码、查询参数或片段。")
+    if parsed.scheme == "http":
+        host = parsed.hostname.lower()
+        loopback = host == "localhost"
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+        if not loopback:
+            raise ValueError("远程模型服务必须使用 HTTPS；HTTP 只允许本机 localhost。")
+    return value
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Credential-bearing model requests require the configured final endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 class _KeepAlivePool:
@@ -87,6 +117,7 @@ class _KeepAlivePool:
         conn.close()
 
     def post_json(self, url: str, headers: dict, body: dict, timeout: float) -> dict:
+        url = validate_transport_url(url)
         p = urllib.parse.urlparse(url)
         scheme = p.scheme or "https"
         port = p.port or (443 if scheme == "https" else 80)
@@ -221,37 +252,6 @@ def pick_api_format(base: str, configured: str | None) -> str:
     return "anthropic" if "anthropic" in (base or "").lower() else "openai"
 
 
-_BUILTIN_MODEL: str | None = None
-
-
-def _resolve_builtin_model(base: str) -> str:
-    """Pick a model name the relay actually serves — asked once per process.
-
-    A distributed bundle freezes whatever name is compiled into it, so the day the relay
-    behind it gains or loses a channel every copy in the wild would start failing with
-    "no permission for this model". Asking the relay what it offers keeps those copies
-    working across channel swaps. Any failure falls back to builtin.MODEL: resolution is
-    an optimisation, never a precondition.
-    """
-    global _BUILTIN_MODEL
-    if _BUILTIN_MODEL is not None:
-        return _BUILTIN_MODEL
-    offered: list[str] = []
-    try:
-        req = urllib.request.Request(f"{base.rstrip('/')}/models",
-                                     headers={"authorization": f"Bearer {builtin.API_KEY}"})
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            offered = [m.get("id") for m in (json.load(resp).get("data") or []) if m.get("id")]
-    except Exception:
-        pass          # offline / not an OpenAI-shaped relay: fall through to the pinned name
-    for want in (builtin.MODEL, *builtin.MODEL_PREFERENCE):
-        if want in offered:
-            _BUILTIN_MODEL = want
-            return want
-    _BUILTIN_MODEL = offered[0] if offered else builtin.MODEL
-    return _BUILTIN_MODEL
-
-
 def load_credentials() -> tuple[str, str, str, str, str]:
     """Returns (base_url, api_key, model, source, api_format). Never raises.
 
@@ -260,7 +260,7 @@ def load_credentials() -> tuple[str, str, str, str, str]:
         OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL         the common case
         ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / ANTHROPIC_MODEL
     User credentials select the API shape by their prefix, including custom endpoints
-    whose URL contains no provider name. Built-in credentials still infer from the URL.
+    whose URL contains no provider name.
     """
     oai = userconfig.provider("OPENAI")
     anth = userconfig.provider("ANTHROPIC")
@@ -271,12 +271,6 @@ def load_credentials() -> tuple[str, str, str, str, str]:
     if anth["key"]:
         base = anth["base"] or DEFAULT_ANTHROPIC_BASE
         return base, anth["key"], anth["model"] or DEFAULT_MODEL, anth["source"], "anthropic"
-
-    # 两个都没配：回退到随包分发的内置凭据，让应用开箱就能出候选。位置在最后，
-    # 所以内置永远不会盖掉用户显式配的那一组。
-    if builtin.API_KEY:
-        return (builtin.BASE_URL, builtin.API_KEY, _resolve_builtin_model(builtin.BASE_URL),
-                BUILTIN_SOURCE, pick_api_format(builtin.BASE_URL, None))
 
     base = oai["base"] or anth["base"] or DEFAULT_OPENAI_BASE
     model = oai["model"] or anth["model"] or DEFAULT_MODEL
@@ -292,7 +286,7 @@ def _extra_params() -> dict:
     naming one option. Malformed JSON is ignored — this runs on every generation, and a
     typo in an optional knob must not be able to take the candidates down.
     """
-    raw = userconfig.get("OPENAI_EXTRA_BODY") or builtin.EXTRA_BODY
+    raw = userconfig.get("OPENAI_EXTRA_BODY")
     if not raw:
         return {}
     try:
@@ -347,6 +341,8 @@ class Generator:
         the old way — streaming degrades, it does not fail.
         """
         base, key, model, _src, api = load_credentials()
+        if not key:
+            raise ValueError(MISSING_HINT)
         # the constructor's overrides win — without this the `model` argument was accepted
         # and silently ignored, so the request went out with whatever the config named
         if self.model_override:
@@ -417,7 +413,8 @@ class Generator:
             url, data=json.dumps({**body, "stream": True}).encode(), headers=headers)
         content: list[str] = []
         reasoning: list[str] = []
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+        validate_transport_url(url)
+        with _NO_REDIRECT_OPENER.open(req, timeout=self.timeout) as r:
             ctype = (r.headers.get("content-type") or "").lower()
             if "event-stream" not in ctype:
                 # the gateway took `stream: true` but answered with one JSON document:

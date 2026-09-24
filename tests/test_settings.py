@@ -7,6 +7,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -16,6 +18,19 @@ import settings_config as config
 
 
 class SettingsFiles(unittest.TestCase):
+    def test_missing_provider_keys_never_fall_back_to_a_packaged_credential(self):
+        from generate import load_credentials
+        empty = {'key': '', 'base': '', 'model': '', 'source': 'none'}
+        with patch.object(userconfig, 'provider', return_value=empty):
+            base, key, _model, source, api = load_credentials()
+        self.assertEqual(base, 'https://api.openai.com/v1')
+        self.assertEqual(key, '')
+        self.assertEqual(source, 'none')
+        self.assertEqual(api, 'openai')
+
+    def test_production_source_has_no_packaged_credential_module(self):
+        self.assertFalse((Path(__file__).resolve().parents[1] / 'src/builtin.py').exists())
+
     def test_preserves_comments_unknown_and_shell_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "env"
@@ -62,6 +77,18 @@ class SettingsFiles(unittest.TestCase):
             self.assertEqual(load_credentials()[-1], 'openai')
             self.assertEqual(load_credentials()[2], 'other')
 
+    def test_provider_key_never_inherits_endpoint_from_a_lower_priority_source(self):
+        sources = [
+            ('环境变量', {'OPENAI_API_KEY': 'environment-key'}),
+            ('项目配置', {'OPENAI_BASE_URL': 'https://attacker.invalid/v1',
+                      'OPENAI_MODEL': 'attacker-model'}),
+        ]
+        with patch.object(userconfig, '_startup_sources', sources):
+            provider = userconfig.provider('OPENAI')
+        self.assertEqual(provider['key'], 'environment-key')
+        self.assertEqual(provider['base'], '')
+        self.assertEqual(provider['model'], '')
+
     def test_running_config_stays_until_restart(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'env'
@@ -79,6 +106,7 @@ class Server(BaseHTTPRequestHandler):
     requests = []
     response = {}
     code = 200
+    redirect_to = None
 
     def log_message(self, *args):
         pass
@@ -87,6 +115,12 @@ class Server(BaseHTTPRequestHandler):
         self.respond(None)
 
     def do_POST(self):
+        if self.redirect_to and self.path == '/redirect':
+            self.requests.append((self.path, dict(self.headers), None))
+            self.send_response(302)
+            self.send_header('Location', self.redirect_to)
+            self.end_headers()
+            return
         self.respond(json.loads(self.rfile.read(int(self.headers['Content-Length']))))
 
     def respond(self, body):
@@ -113,6 +147,7 @@ class SettingsNetwork(unittest.TestCase):
     def setUp(self):
         Server.requests = []
         Server.code = 200
+        Server.redirect_to = None
 
     def test_dynamic_models_and_versioned_custom_base(self):
         Server.response = {'data': [{'id': 'actual-model'}, {'id': 'actual-model'}, {'id': 'new-model'}]}
@@ -170,6 +205,75 @@ class SettingsNetwork(unittest.TestCase):
             self.assertIn(str(status), msg)
             self.assertNotIn('SECRET', msg)
         self.assertEqual(len(Server.requests), 4)
+
+    def test_remote_http_is_rejected_but_loopback_http_is_allowed(self):
+        for allowed in (
+                self.base,
+                'http://localhost:11434/v1',
+                'http://127.99.0.1:11434/v1',
+                'http://[::1]:11434/v1',
+                'https://api.example.com/v1'):
+            self.assertEqual(config.validate_endpoint(allowed), allowed.rstrip('/'))
+        for rejected in (
+                'http://example.com/v1',
+                'http://192.168.1.20/v1',
+                'http://0.0.0.0:11434/v1',
+                'http://localhost.evil.example/v1'):
+            with self.subTest(rejected=rejected), self.assertRaises(ValueError):
+                config.validate_endpoint(rejected)
+
+    def test_runtime_transport_rejects_env_configured_remote_http_before_connecting(self):
+        import generate
+        pool = generate._KeepAlivePool()
+        with patch.object(pool, '_checkout', side_effect=AssertionError('socket opened')):
+            with self.assertRaises(ValueError):
+                pool.post_json('http://example.com/v1/chat/completions', {}, {}, 1)
+
+    def test_direct_generator_call_without_a_key_fails_before_network(self):
+        from generate import Generator
+        with patch('generate.load_credentials', return_value=(
+                'https://api.openai.com/v1', '', 'model', 'none', 'openai')):
+            generator = Generator()
+            with patch.object(generator, '_post', side_effect=AssertionError('network called')):
+                with self.assertRaisesRegex(ValueError, 'Key'):
+                    generator._call('hello')
+
+    def test_streaming_request_does_not_follow_a_credential_bearing_redirect(self):
+        from generate import Generator
+        Server.redirect_to = self.base + '/target'
+        generator = Generator(timeout=2)
+        with self.assertRaises(urllib.error.HTTPError):
+            generator._stream_openai(
+                self.base + '/redirect',
+                {'content-type': 'application/json', 'authorization': 'Bearer SECRET'},
+                {'model': 'm', 'messages': []}, 'm', 'alt', lambda _frag: None)
+        self.assertEqual([row[0] for row in Server.requests], ['/redirect'])
+
+    def test_streaming_transport_does_not_use_environment_proxies(self):
+        import generate
+        proxy_handlers = [h for h in generate._NO_REDIRECT_OPENER.handlers
+                          if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertEqual(proxy_handlers, [])
+
+    def test_jev_key_never_inherits_endpoint_from_a_lower_priority_source(self):
+        from judge_jev import JevJudge, DEFAULT_BASE
+        sources = [
+            ('环境变量', {'TYPESAFE_API_KEY': 'environment-key'}),
+            ('项目配置', {'TYPESAFE_BASE_URL': 'https://attacker.invalid'}),
+        ]
+        with patch.object(userconfig, '_startup_sources', sources):
+            judge = JevJudge()
+        self.assertEqual(judge.key, 'environment-key')
+        self.assertEqual(judge.base, DEFAULT_BASE)
+
+    def test_direct_jev_call_without_a_key_fails_before_network(self):
+        from judge_jev import JevJudge
+        with patch.object(userconfig, 'provider', return_value={
+                'key': '', 'base': '', 'model': '', 'source': 'none'}):
+            judge = JevJudge()
+        with patch('judge_jev.http_post_json', side_effect=AssertionError('network called')):
+            with self.assertRaisesRegex(ValueError, 'key'):
+                judge.judge('hello')
 
 
 class PerceptionSource(unittest.TestCase):
@@ -280,7 +384,24 @@ class WechatKeys(unittest.TestCase):
                 patch.object(userconfig, 'PROJECT_ENV', Path('/nonexistent/.env')):
             import wechat_keys
             self.assertEqual(str(wechat_keys.keys_file()), '/tmp/jev-test-keys.json')
-            self.assertTrue(wechat_keys.extraction_command().endswith('--decrypt'))
+            self.assertNotIn('--decrypt', wechat_keys.extraction_command())
+
+    def test_project_extractor_only_creates_private_key_material(self):
+        root = Path(__file__).resolve().parents[1]
+        script = (root / 'tools/extract_wechat_keys.command').read_text()
+        self.assertIn('umask 077', script)
+        self.assertIn('chmod 700 "$APP_SUPPORT"', script)
+        self.assertIn('chmod 600 "$KEYS_FILE"', script)
+        self.assertNotIn('extract --output "$KEYS_FILE" --decrypt', script)
+        self.assertNotIn('APP_SUPPORT/decrypted', script)
+        self.assertIn('/decrypted/', (root / '.gitignore').read_text())
+
+    def test_packaging_secret_scan_has_no_source_file_exception(self):
+        build = (Path(__file__).resolve().parents[1] / 'packaging/build_app.sh').read_text()
+        self.assertNotIn('--exclude=builtin.py', build)
+        self.assertNotIn('内置凭据是刻意保留', build)
+        self.assertIn('"$APP/Contents/Resources/app"', build)
+        self.assertIn('PRIVATE KEY', build)
 
     def test_key_count_tolerates_missing_and_broken_files(self):
         import wechat_keys

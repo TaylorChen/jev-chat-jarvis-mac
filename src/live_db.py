@@ -41,6 +41,18 @@ def _resolve_sqlcipher() -> str:
 
 
 SQLCIPHER = _resolve_sqlcipher()
+
+
+class LiveQueryError(RuntimeError):
+    """A live database query failed; distinct from a successful zero-row result."""
+
+
+def _is_message_shard_name(name: str) -> bool:
+    """True only for numbered message_N.db / biz_message_N.db shards."""
+    for prefix in ("message_", "biz_message_"):
+        if name.startswith(prefix) and name.endswith(".db"):
+            return name[len(prefix):-3].isdigit()
+    return False
 XWECHAT_FILES = Path.home() / ("Library/Containers/com.tencent.xinWeChat/Data/"
                                "Documents/xwechat_files")
 # 密钥文件位置由 wechat_keys 统一决定（显式配置 > 应用数据目录 > 旧手工布局）
@@ -88,7 +100,7 @@ def _looks_like_raw_id(name: str) -> bool:
     """原始 wxid / openim id / 纯数字 id：这些不该出现在面板和判断 prompt 里。
 
     群消息的说话人写在正文前缀里（`昵称:\n正文`），但有些成员在群里的昵称就是自己的
-    原始 id（实测 `25984981997518334@openim`），面板上「来自 2598498…@openim」既看不懂
+    原始 id（例如 `12345678901234567@openim`），面板上展示数字 id 既看不懂
     也进不了判断的价值。contact.db 里通常有真名，用它换掉。
     """
     n = (name or "").strip()
@@ -162,7 +174,7 @@ class LiveProvider:
         self.self_wxid = self_wxid or self._detect_self_wxid()
         self._contact = {}
         self._db_tables = {}     # rel -> (集合, 时间戳)；空集合 + 时间戳 = 60s 内不重扫
-        self._thumb_cache = {}   # (username, 分钟桶) -> [(mtime, path)]
+        self._thumb_cache = {}   # (username, 120 秒桶) -> [(mtime, path)]
         self._self_ids = {}      # db_filename -> self rowid
         self._load_contact()
         # 启动自检：认不出「自己」时每一条消息都会被当成对方（连自己的话一起分析），
@@ -184,7 +196,7 @@ class LiveProvider:
         """
         rels = [r for r in sorted(self.keys,
                                   key=lambda r: (r.startswith("message/biz_"), r))
-                if r.startswith("message/")][:probes]
+                if _is_message_shard_name(Path(r).name)][:probes]
         return any(self._self_id_of_rel(rel) is not None for rel in rels)
 
     def _load_contact(self):
@@ -220,31 +232,45 @@ class LiveProvider:
         """sqlcipher -readonly 直接打开 live 加密库（实时、零拷贝、绝不写微信文件）。
 
         微信活跃写入时只读打开可能间歇性失败（合并/检查点窗口），
-        自动重试即可穿过；仍失败则返回 []，下一轮轮询会再试。
+        自动重试即可穿过；仍失败则抛出 LiveQueryError，让 UI 明确报错并退避。
         """
         key_entry = self.keys.get(rel_path)
         if not key_entry:
-            return []
+            raise LiveQueryError(f"{rel_path}: 缺少数据库密钥")
         live_file = self.live_dir / rel_path
         if not live_file.exists():
-            return []
+            raise LiveQueryError(f"{rel_path}: 数据库文件不存在")
         script = key_script(key_entry["enc_key"], sql)
+        last_reason = "未知错误"
         for _attempt in range(attempts):
             try:
                 r = subprocess.run(
                     [SQLCIPHER, "-readonly", str(live_file)], input=script,
                     capture_output=True, text=True, timeout=60)
             except subprocess.TimeoutExpired:
+                last_reason = "查询超时"
                 time.sleep(0.6)
                 continue
-            out = r.stdout
+            if r.returncode != 0:
+                detail = (r.stderr or "").strip().replace("\n", " ")[:160]
+                last_reason = f"sqlcipher 退出码 {r.returncode}" + (f": {detail}" if detail else "")
+                time.sleep(0.4)
+                continue
+            out = (r.stdout or "").strip()
+            if not out:
+                return []
+            if all(line.strip() == "ok" for line in out.splitlines() if line.strip()):
+                return []
             if "[" in out and "]" in out:
                 try:
-                    return json.loads(out[out.find("["): out.rfind("]") + 1])
+                    rows = json.loads(out[out.find("["): out.rfind("]") + 1])
+                    if isinstance(rows, list):
+                        return rows
                 except json.JSONDecodeError:
                     pass
+            last_reason = "sqlcipher 返回了无效 JSON"
             time.sleep(0.4)
-        return []
+        raise LiveQueryError(f"{rel_path}: {last_reason}")
 
     def _tables_of(self, rel_path: str) -> set:
         """该库中所有 Msg_* 表名，缓存为 (表集合, 时间戳)。
@@ -278,7 +304,8 @@ class LiveProvider:
         table = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
         rels = [f"message/{f.name}"
                 for f in sorted((self.live_dir / "message").glob("*.db"))
-                if f"message/{f.name}" in self.keys]
+                if (_is_message_shard_name(f.name)
+                    and f"message/{f.name}" in self.keys)]
         stale = [rel for rel in rels if self._tables_stale(rel)]
         if len(stale) > 1:
             with concurrent.futures.ThreadPoolExecutor(
@@ -288,20 +315,22 @@ class LiveProvider:
             self._tables_of(stale[0])
         return [(rel, table) for rel in rels if table in self._tables_of(rel)]
 
-    def _thumb_index(self, username: str | None = None) -> list[tuple[float, Path]]:
-        """attach 树的缩略图索引 [(mtime, path)]（120s 缓存；username 参数兼容旧调用）。
+    def _thumb_index(self, username: str) -> list[tuple[float, Path]]:
+        """当前会话 attach 子树的缩略图索引 [(mtime, path)]（120s 缓存）。
 
-        微信 4.x：attach/<hash>/<YYYY-MM>/Img/<md5>_t_M.dat 为**未加密 JPEG**
-        （hash 目录与会话的对应关系随版本变化，故直接全树扫描、按 mtime 匹配）；
+        微信 4.x：attach/<md5(username)>/<YYYY-MM>/Img/<md5>_t_M.dat 为未加密 JPEG；
+        会话目录不存在时宁可不显示图片，也绝不退回全树扫描猜测，避免跨会话串图。
         新版 _t.dat 为 V2 加密格式暂无法解出（对应消息显示占位符）。
         """
-        cache_key = int(time.time() // 120)
+        cache_key = (username, int(time.time() // 120))
         cached = self._thumb_cache.get(cache_key)
         if cached is not None:
             return cached
-        for k in [k for k in self._thumb_cache if k != cache_key]:
+        for k in [k for k in self._thumb_cache
+                  if k[0] == username and k != cache_key]:
             self._thumb_cache.pop(k, None)
-        attach = self.live_dir.parent / "msg" / "attach"
+        attach = (self.live_dir.parent / "msg" / "attach"
+                  / hashlib.md5(username.encode()).hexdigest())
         out: list[tuple[float, Path]] = []
         if attach.exists():
             for pth in attach.rglob("*_t_M.dat"):
@@ -314,17 +343,8 @@ class LiveProvider:
         return out
 
     def _thumb_for(self, username: str, ts: float) -> Path | None:
-        """找 mtime 最接近消息时间的缩略图（±10 分钟）。"""
-        idx = self._thumb_index(username)
-        if not idx:
-            return None
-        best = min(idx, key=lambda e: abs(e[0] - ts))
-        return best[1] if abs(best[0] - ts) <= 600 else None
-
-
-    def _thumb_for(self, username: str, ts: float) -> Path | None:
         """找 mtime 最接近消息时间的缩略图（±8 分钟）。"""
-        idx = self._thumb_index()
+        idx = self._thumb_index(username)
         if not idx:
             return None
         best = min(idx, key=lambda e: abs(e[0] - ts))
@@ -341,9 +361,14 @@ class LiveProvider:
         if rel in self._self_ids:
             return self._self_ids[rel]
         for col in ("user_name", "username"):
-            rows = self._query(rel,
-                               "SELECT rowid AS rid FROM Name2Id "
-                               f"WHERE {col}={self._sqlstr(self.self_wxid)}")
+            try:
+                rows = self._query(rel,
+                                   "SELECT rowid AS rid FROM Name2Id "
+                                   f"WHERE {col}={self._sqlstr(self.self_wxid)}")
+            except LiveQueryError as e:
+                if "no such column" in str(e):
+                    continue
+                raise
             if rows:
                 rid = int(rows[0]["rid"])
                 self._self_ids[rel] = rid
