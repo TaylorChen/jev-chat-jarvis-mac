@@ -4,14 +4,35 @@ Run: python -B -m unittest discover -s tests
 """
 import datetime
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import AppKit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import message_view  # noqa: E402
 
 
 class FormatRowsTests(unittest.TestCase):
+    def test_rich_text_uses_an_nscolor_object_not_the_text_color_method(self):
+        rich = message_view.attributed_rows([(0, 'them', None, 'hello')])
+        color, _effective = rich.attribute_atIndex_effectiveRange_(
+            AppKit.NSForegroundColorAttributeName, 0, None)
+        self.assertIsInstance(color, AppKit.NSColor)
+        self.assertFalse(callable(color))
+
+    def test_image_message_builds_a_real_text_attachment(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'thumb.png'
+            image = AppKit.NSImage.alloc().initWithSize_((8, 8))
+            rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(
+                None, 8, 8, 8, 4, True, False, AppKit.NSDeviceRGBColorSpace, 0, 0)
+            rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {}) \
+                .writeToFile_atomically_(str(path), True)
+            rich = message_view.attributed_rows([(0, 'them', None, '[图片]', path)])
+            self.assertTrue(rich.containsAttachments())
+
     def test_known_timestamp_is_formatted(self):
         ts = int(datetime.datetime(2026, 9, 23, 16, 31).timestamp())
         text = message_view.format_rows([(ts, 'them', '张三', '下午开会')])

@@ -37,12 +37,11 @@ def attributed_rows(rows):
 
     图片行（img_path 非空）渲染为：文字行 + 换行 + 缩略图附件（宽 240pt 等比）。
     """
-    import time as _time
     font = AppKit.NSFont.monospacedSystemFontOfSize_weight_(12, 0) \
         if hasattr(AppKit.NSFont, "monospacedSystemFontOfSize_weight_") \
         else AppKit.NSFont.systemFontOfSize_(12)
     attrs = {AppKit.NSFontAttributeName: font,
-             AppKit.NSForegroundColorAttributeName: AppKit.NSColor.textColor}
+             AppKit.NSForegroundColorAttributeName: AppKit.NSColor.textColor()}
     out = AppKit.NSMutableAttributedString.alloc().init()
     for row in rows:
         ts, who, sender, text = row[0], row[1], row[2], row[3]
@@ -58,12 +57,13 @@ def attributed_rows(rows):
                 size = img.size()
                 if size.width > 220:
                     img.setSize_(NSMakeSize(220, size.height * 220 / size.width))
-                cell = AppKit.NSTextAttachmentCell.imageCell_(img)
+                cell = AppKit.NSTextAttachmentCell.alloc().initImageCell_(img)
                 att = AppKit.NSTextAttachment.alloc().init()
                 att.setAttachmentCell_(cell)
                 out.appendAttributedString_(
-                    AppKit.NSAttributedString.alloc().initWithString_attributes_(
-                        "\uFFFC\n", attrs))
+                    AppKit.NSAttributedString.alloc().initWithAttachment_attributes_(att, attrs))
+                out.appendAttributedString_(
+                    AppKit.NSAttributedString.alloc().initWithString_attributes_("\n", attrs))
     return out
 
 
