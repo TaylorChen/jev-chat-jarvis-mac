@@ -752,22 +752,19 @@ class HudController(NSObject):
 
     @objc.python_method
     def _source_badge(self) -> str:
-        """面板标题上的数据源/条数：这是「到底在读库还是读屏」最短的答案。
+        """面板标题：数据库模式保持简洁，OCR 与手动跟随状态仍明确显示。
 
-        放在窗口标题而不是行内：行内那句（sender 行）经常被长群名挤掉，而这个问题
-        用户会反复问（「是不是还在 OCR」），必须一直看得见。
+        数据库读取范围与条数已经在 span 元信息行展示，不再重复挤占标题栏。
         """
         if not self._db_mode:
             return "jev-jarvis · OCR 读屏"
-        n = len(getattr(self, "_last_msgs", None) or [])
-        base = f"jev-jarvis · 数据库直读 {n} 条" if n else "jev-jarvis · 数据库直读"
-        return base + (" · 手动" if getattr(self, "_pin_label", "") else "")
+        return "jev-jarvis" + (" · 手动" if getattr(self, "_pin_label", "") else "")
 
     @objc.python_method
     def _window_text(self) -> str:
         """面板那行「历史窗口」：这段上下文的起止时间与条数。
 
-        用户要的就是「我看的这一眼是哪一段历史」——条数已经在标题栏，这里给时间范围，
+        用户要的就是「我看的这一眼是哪一段历史」——这里同时给时间范围和条数，
         一眼能对上「是刚才还是上午」。读屏模式没有时间戳，就照实说。
         """
         msgs = getattr(self, "_last_msgs", None) or []
@@ -1395,7 +1392,7 @@ class HudController(NSObject):
         # 留给「查看读到的消息…」：读到的原样消息 + 会话名，菜单里点开即可核对判断喂了什么
         self._last_msgs = msgs
         self._last_chat = res.get("chat_title") or ""
-        self._push("applySource:", self._source_badge())   # 标题上写清库/屏 + 条数
+        self._push("applySource:", self._source_badge())   # DB 标题简洁；OCR/手动状态仍可见
         self._push("applyWindow:", self._window_text())    # 这一眼用的是哪一段历史
         self._refresh_message_view()
 

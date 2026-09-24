@@ -666,18 +666,18 @@ class PinSessionTests(unittest.TestCase):
 
 
 class SourceBadgeTests(unittest.TestCase):
-    """面板标题必须一直写清「在读库还是读屏」+ 条数（用户反复问的那件事）。"""
+    """数据库直读时标题保持简洁；OCR 与手动跟随状态仍需可见。"""
 
-    def test_db_mode_reports_mode_and_count(self):
+    def test_db_mode_title_does_not_show_source_or_message_count(self):
         h = Harness()
         h._db_mode = True
         h._last_msgs = [object()] * 99
-        self.assertEqual(h._source_badge(), 'jev-jarvis · 数据库直读 99 条')
+        self.assertEqual(h._source_badge(), 'jev-jarvis')
 
     def test_db_mode_before_the_first_read_has_no_count(self):
         h = Harness()
         h._db_mode = True
-        self.assertEqual(h._source_badge(), 'jev-jarvis · 数据库直读')
+        self.assertEqual(h._source_badge(), 'jev-jarvis')
 
     def test_ocr_mode_says_so(self):
         h = Harness()
