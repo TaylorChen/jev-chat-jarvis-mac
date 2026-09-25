@@ -221,6 +221,13 @@ class FallbackJudge:
         self.local = None
         self.fell_back = False
         self.reason = ""
+        self.on_fallback = None
+
+    def _mark_fallback(self, error: Exception) -> None:
+        self.fell_back = True
+        self.reason = f"{type(error).__name__}: {str(error)[:80]}"
+        if self.on_fallback is not None:
+            self.on_fallback(self.reason)
 
     def _fallback(self):
         if self.local is None:
@@ -232,8 +239,7 @@ class FallbackJudge:
             try:
                 return self.primary.judge(message, context)
             except Exception as e:
-                self.fell_back = True
-                self.reason = f"{type(e).__name__}: {str(e)[:80]}"
+                self._mark_fallback(e)
         out = self._fallback().judge(message, context)
         out["backend"] = f"local (Jev 不可用: {self.reason})"
         return out
@@ -243,8 +249,7 @@ class FallbackJudge:
             try:
                 return self.primary.rank_candidates(message, intent, candidates)
             except Exception as e:
-                self.fell_back = True
-                self.reason = f"{type(e).__name__}: {str(e)[:80]}"
+                self._mark_fallback(e)
         return self._fallback().rank_candidates(message, intent, candidates)
 
     def warm(self) -> None:

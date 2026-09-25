@@ -233,6 +233,9 @@ class HudController(NSObject):
         self._read_once = False        # first OCR call includes Vision's own load
         self._last_skip_reason = None
         self.judge = make_judge()
+        if hasattr(self.judge, "on_fallback"):
+            self.judge.on_fallback = lambda reason: _log(
+                f"Jev 调用失败，切换本地模型 · {reason.replace(chr(10), ' ')[:120]}")
         # 数据源：db（默认，读微信本地库）或 ocr（读屏）。可配置，也能用 --source 临时覆盖。
         # db 需要先用 tools/extract_wechat_keys.command 提取密钥；回退与原因都在
         # wechat_keys.resolve_source 里定，这里只落地面板状态 + 记下「想用 db 却退回」
@@ -1813,7 +1816,10 @@ class HudController(NSObject):
         ranked = self._rank_payload(payload, newest.text, intent) if intent else payload
         rank_ms = (time.perf_counter() - t_rank) * 1000
         if intent:
-            _log(f"排序 {rank_ms:.0f}ms（本地模型，一次前向）")
+            rank_backend = (f"Jev/{self.judge.primary.model}"
+                            if getattr(self.judge, "fell_back", None) is False
+                            else "本地模型")
+            _log(f"排序 {rank_ms:.0f}ms（{rank_backend}，一次请求）")
         _log(f"端到端 {(time.perf_counter() - t0) * 1000:.0f}ms"
              f" · 从分析开始到候选上屏")
         self._push("applyCandidates:", ranked)
@@ -2152,9 +2158,15 @@ def main() -> None:
     # First line of every run: which backends are actually in play. Support requests
     # always need it, and it proves the log is live before the first message arrives.
     _base, _key, _model, _src, _api = load_credentials()
+    jev_enabled = bool(userconfig.get('TYPESAFE_API_KEY', 'JEV_API_KEY'))
+    judge_label = "本地 decider-2b"
+    if jev_enabled and hasattr(controller.judge, "primary"):
+        judge_label = f"TypeSafe Jev / {controller.judge.primary.model}"
+        if userconfig.get("JEV_ALLOW_INSECURE_HTTP").strip().lower() in (
+                "1", "true", "yes", "on"):
+            judge_label += " / 私网 HTTP 已允许"
     _log(f"启动 · 数据源 {'数据库直读' if controller._db_mode else 'OCR 读屏'}"
-         f" · 判断层 "
-         f"{'TypeSafe Jev' if userconfig.get('TYPESAFE_API_KEY', 'JEV_API_KEY') else '本地 decider-2b'}"
+         f" · 判断层 {judge_label}"
          f" · 生成层 {(_base + ' / ' + _model) if _key else '未配置（候选区会是空的）'}"
          + (" · YOLO 框开" if controller._show_boxes else ""))
     controller._show()

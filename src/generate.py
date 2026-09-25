@@ -48,8 +48,13 @@ MISSING_HINT = ("未配置生成层 Key：候选回复需要它，判断/风险�
                 "设置 OPENAI_API_KEY（或 ANTHROPIC_API_KEY）后重启，见 README 配置章节。")
 
 
-def validate_transport_url(url: str, *, allow_query: bool = False) -> str:
-    """Return a safe HTTP(S) URL; cleartext is allowed only on literal loopback hosts."""
+_PRIVATE_HTTP_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+
+def validate_transport_url(url: str, *, allow_query: bool = False,
+                           allow_private_http: bool = False) -> str:
+    """Return a safe HTTP(S) URL; cleartext requires loopback or explicit LAN opt-in."""
     value = (url or "").strip().rstrip("/")
     parsed = urllib.parse.urlsplit(value)
     if (parsed.scheme not in ("http", "https") or not parsed.hostname
@@ -64,8 +69,19 @@ def validate_transport_url(url: str, *, allow_query: bool = False) -> str:
                 loopback = ipaddress.ip_address(host).is_loopback
             except ValueError:
                 loopback = False
-        if not loopback:
-            raise ValueError("远程模型服务必须使用 HTTPS；HTTP 只允许本机 localhost。")
+        private_lan = False
+        if allow_private_http:
+            try:
+                address = ipaddress.ip_address(host)
+                private_lan = (address.version == 4
+                               and any(address in network
+                                       for network in _PRIVATE_HTTP_NETWORKS))
+            except ValueError:
+                pass
+        if not loopback and not private_lan:
+            raise ValueError(
+                "远程模型服务必须使用 HTTPS；HTTP 只允许本机，"
+                "Jev 可通过 JEV_ALLOW_INSECURE_HTTP=1 显式放行私有局域网 IP。")
     return value
 
 
@@ -116,8 +132,9 @@ class _KeepAlivePool:
                 return
         conn.close()
 
-    def post_json(self, url: str, headers: dict, body: dict, timeout: float) -> dict:
-        url = validate_transport_url(url)
+    def post_json(self, url: str, headers: dict, body: dict, timeout: float, *,
+                  allow_private_http: bool = False) -> dict:
+        url = validate_transport_url(url, allow_private_http=allow_private_http)
         p = urllib.parse.urlparse(url)
         scheme = p.scheme or "https"
         port = p.port or (443 if scheme == "https" else 80)
@@ -149,9 +166,11 @@ class _KeepAlivePool:
 _POOL = _KeepAlivePool()
 
 
-def http_post_json(url: str, headers: dict, body: dict, timeout: float) -> dict:
+def http_post_json(url: str, headers: dict, body: dict, timeout: float, *,
+                   allow_private_http: bool = False) -> dict:
     """模块级 POST 入口：generate 与 judge_jev 共用同一个连接池。"""
-    return _POOL.post_json(url, headers, body, timeout)
+    return _POOL.post_json(
+        url, headers, body, timeout, allow_private_http=allow_private_http)
 
 
 class ThinkingOnlyError(Exception):

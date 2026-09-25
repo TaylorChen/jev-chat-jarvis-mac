@@ -36,6 +36,11 @@ DEFAULT_MODEL = "jev-latest"
 TIMEOUT = 30
 
 
+def _allow_private_http() -> bool:
+    return userconfig.get("JEV_ALLOW_INSECURE_HTTP").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def jev_configured() -> bool:
     """True when a TypeSafe key is present — callers prefer Jev over the local model."""
     return bool(userconfig.provider("TYPESAFE", "JEV_API_KEY")["key"])
@@ -134,7 +139,8 @@ class JevJudge:
             url,
             {"content-type": "application/json",
              "authorization": f"Bearer {self.key}"},
-            payload, self.timeout)
+            payload, self.timeout,
+            allow_private_http=_allow_private_http())
 
     def warm(self) -> None:
         """Nothing to load — kept so the two backends share a surface."""

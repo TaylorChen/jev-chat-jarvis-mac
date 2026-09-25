@@ -10,7 +10,7 @@ import unittest
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import userconfig
@@ -222,6 +222,24 @@ class SettingsNetwork(unittest.TestCase):
             with self.subTest(rejected=rejected), self.assertRaises(ValueError):
                 config.validate_endpoint(rejected)
 
+    def test_private_http_requires_explicit_jev_opt_in(self):
+        import generate
+        private_urls = (
+            'http://10.0.0.8:8000',
+            'http://172.16.0.8:8000',
+            'http://192.168.1.20:8000',
+        )
+        for url in private_urls:
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    generate.validate_transport_url(url)
+                self.assertEqual(
+                    generate.validate_transport_url(url, allow_private_http=True), url)
+        for url in ('http://8.8.8.8:8000', 'http://0.0.0.0:8000',
+                    'http://service.example.com:8000'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                generate.validate_transport_url(url, allow_private_http=True)
+
     def test_runtime_transport_rejects_env_configured_remote_http_before_connecting(self):
         import generate
         pool = generate._KeepAlivePool()
@@ -274,6 +292,32 @@ class SettingsNetwork(unittest.TestCase):
         with patch('judge_jev.http_post_json', side_effect=AssertionError('network called')):
             with self.assertRaisesRegex(ValueError, 'key'):
                 judge.judge('hello')
+
+    def test_jev_private_http_opt_in_is_forwarded_only_when_enabled(self):
+        from judge_jev import JevJudge
+        configured = {'key': 'key', 'base': 'http://192.168.1.20:8000',
+                      'model': 'jev-1', 'source': 'test'}
+        response = {'answers': {'intent': {'choice': '闲聊'}, 'risk': {'score': 0}}}
+        with patch.object(userconfig, 'provider', return_value=configured), \
+                patch.object(userconfig, 'get', return_value='1'), \
+                patch('judge_jev.http_post_json', return_value=response) as post:
+            JevJudge().judge('hello')
+        self.assertTrue(post.call_args.kwargs['allow_private_http'])
+
+    def test_jev_fallback_reports_the_primary_error_before_loading_local(self):
+        from judge import FallbackJudge
+        judge = FallbackJudge.__new__(FallbackJudge)
+        judge.primary = Mock()
+        judge.primary.judge.side_effect = ValueError('transport blocked')
+        judge.local = None
+        judge.fell_back = False
+        judge.reason = ''
+        reported = []
+        judge.on_fallback = reported.append
+        with patch.object(judge, '_fallback', side_effect=RuntimeError('local load')):
+            with self.assertRaisesRegex(RuntimeError, 'local load'):
+                judge.judge('hello')
+        self.assertEqual(reported, ['ValueError: transport blocked'])
 
 
 class PerceptionSource(unittest.TestCase):

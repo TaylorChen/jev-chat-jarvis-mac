@@ -166,6 +166,7 @@ uv run python probe/bootstrap_regression.py      # 两种启动入口的离线�
 - 密钥掩码显示；窗口仅读取所编辑文件中的值，不把环境变量或项目 `.env` 中的密钥复制进用户文件。各配置页顶部显示本次启动使用的实际来源；生成页同时标明当前启用的服务。
 - 环境变量优先于用户 env，用户 env 优先于项目 `.env`；生成层 OpenAI 组优先于 Anthropic 组。两组均未配置时不发起生成请求。清空当前文件的密钥不会禁用其他来源中的密钥。由终端或启动器导出的值也显示为「环境变量」。
 - API 格式由密钥组决定：`OPENAI_*` 使用 OpenAI 格式，`ANTHROPIC_*` 使用 Anthropic 格式；自定义地址不需要包含服务名称。Ollama 可填 `http://localhost:11434/v1`、密钥 `ollama`，模型从本地服务获取或手填。Jev 地址沿用判断层约定，不含末尾 `/v1`。
+- 远程服务默认必须使用 HTTPS。可信局域网内部署的 Jev 可显式设置 `JEV_ALLOW_INSECURE_HTTP=1`，此时仅放行 `10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16` 的 HTTP IP 地址；不影响 OpenAI/Anthropic 生成层，也不放行公网 HTTP。HTTP 会明文传输 Key 和聊天上下文，只应在可信网络中开启。
 - 钥匙串：不新增钥匙串读写。如果原 env 用 `$(security find-generic-password …)` 等 shell 表达式提供密钥，窗口不执行表达式、不展示其内容，未输入新密钥时保留原行；仍由已有启动器执行。要在窗口测试该服务，需明确输入密钥；保存将用输入值替换原表达式。外部注入的密钥继续遵循环境变量优先级。
 - `JEV_BOXES`、`JEV_TONES`、`OPENAI_EXTRA_BODY`、`JEV_DB_WATCH`、`JEV_LIVE_DIR`、`JEV_DB_DIR` 暂仍通过 env 配置，保存窗口不会改动它们（数据源与密钥文件位置已在「感知 · 数据源」页内可编辑）。OpenAI 连接测试沿用当前启动的 `OPENAI_EXTRA_BODY`；完整话术管理等留待后续扩展。
 
@@ -176,6 +177,8 @@ mkdir -p ~/.config/jev-jarvis
 cat > ~/.config/jev-jarvis/env <<'ENV'
 # 判断层（可选）：TypeSafe Jev，不填用本地 decider-2b
 export TYPESAFE_API_KEY=""
+# 仅可信局域网 Jev 需要；默认不允许携带凭据访问远程 HTTP
+# export JEV_ALLOW_INSECURE_HTTP=1
 
 # 生成层：任意 OpenAI 兼容端点
 export OPENAI_API_KEY="sk-你的key"

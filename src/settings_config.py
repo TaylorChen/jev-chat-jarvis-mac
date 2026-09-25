@@ -86,13 +86,20 @@ def write_settings(path: Path, original: str, changes: dict[str, str]) -> str:
     return text
 
 
-def validate_endpoint(base: str) -> str:
-    return validate_transport_url(base)
+def _allow_jev_private_http(prefix: str) -> bool:
+    return (prefix == "TYPESAFE"
+            and userconfig.get("JEV_ALLOW_INSECURE_HTTP").strip().lower()
+            in ("1", "true", "yes", "on"))
+
+
+def validate_endpoint(base: str, *, allow_private_http: bool = False) -> str:
+    return validate_transport_url(base, allow_private_http=allow_private_http)
 
 
 def list_models(prefix: str, base: str, key: str) -> list[str]:
     """GET the provider's models endpoint. No presets, redirects or alternate service."""
-    base = validate_endpoint(base)
+    allow_private_http = _allow_jev_private_http(prefix)
+    base = validate_endpoint(base, allow_private_http=allow_private_http)
     if not key:
         raise ValueError("请先填写密钥；Ollama 可填写 ollama。")
     api = "anthropic" if prefix == "ANTHROPIC" else "openai"
@@ -135,7 +142,8 @@ def list_models(prefix: str, base: str, key: str) -> list[str]:
 
 def test_connection(prefix: str, base: str, key: str, model: str, extra: dict | None = None) -> None:
     """Use exactly the unsaved form values; never fall back to built-in credentials."""
-    base = validate_endpoint(base)
+    allow_private_http = _allow_jev_private_http(prefix)
+    base = validate_endpoint(base, allow_private_http=allow_private_http)
     if not key or not model.strip():
         raise ValueError("请填写密钥和模型后再测试。")
     if prefix == "TYPESAFE":
@@ -143,7 +151,8 @@ def test_connection(prefix: str, base: str, key: str, model: str, extra: dict | 
         body = {"model": model, "state": "你好", "questions": {
             "test": {"type": "choice", "instructions": "请选择问候", "criteria": {"问候": None}}}}
         data = http_post_json(base + "/v1/systemone", {
-            "content-type": "application/json", "authorization": f"Bearer {key}"}, body, 30)
+            "content-type": "application/json", "authorization": f"Bearer {key}"},
+            body, 30, allow_private_http=allow_private_http)
         if ((data.get("answers") or {}).get("test") or {}).get("choice") != "问候":
             raise ValueError("服务返回了响应，但未返回有效判断结果。")
         return
