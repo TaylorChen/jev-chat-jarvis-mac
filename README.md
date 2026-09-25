@@ -264,9 +264,7 @@ Jev 调用失败时，日志会立即记录脱敏后的异常类型并标明是�
 
 ## 交流反馈
 
-Issue、功能建议和贡献可以直接走 GitHub。也可以扫码加入交流群；二维码可能过期，失效时请提 issue：
-
-<img src="docs/wechat-group.png" width="200" alt="扫码加入微信交流群">
+Issue、功能建议和贡献请直接通过 GitHub 提交。
 
 ## 许可与免责
 
